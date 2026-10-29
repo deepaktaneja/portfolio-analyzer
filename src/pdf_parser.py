@@ -140,12 +140,39 @@ def discover_pdfs(folder: str) -> list[str]:
     return files
 
 
-def parse_folder(folder: str) -> list[dict]:
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+# ... keep imports; add store import lazily to avoid circular
+def parse_folder(folder: str, store=None) -> list[dict]:
     all_rows: list[dict] = []
+    known = store.known_files() if store is not None else {}
     for pdf in discover_pdfs(folder):
+        name = Path(pdf).name
         try:
-            all_rows.extend(parse_pdf(pdf))
+            mtime = os.path.getmtime(pdf)
+        except OSError:
+            mtime = 0.0
+        if store is not None and name in known and abs(known[name] - mtime) < 1e-9:
+            # already parsed; skip
+            continue
+        try:
+            rows = parse_pdf(pdf)
         except Exception:  # noqa: BLE001
             continue
+        if store is not None:
+            store.replace_file_transactions(name, rows)
+            store.upsert_file(name, mtime, len(rows))
+        all_rows.extend(rows)
+    if store is not None:
+        return store.all_transactions()
+    # fallback: re-parse everything (no store)
+    if not all_rows:
+        for pdf in discover_pdfs(folder):
+            try:
+                all_rows.extend(parse_pdf(pdf))
+            except Exception:  # noqa: BLE001
+                continue
     all_rows.sort(key=lambda r: (r.get("settlement_date") or "9999", r.get("isin") or ""))
     return all_rows

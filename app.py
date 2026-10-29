@@ -10,6 +10,7 @@ import streamlit as st
 from src.holdings import current_value_for, load_holdings
 from src.pdf_parser import parse_folder
 from src.reconcile import reconcile
+from src.store import SQLiteStore
 from src.xirr import annualize_pct, compute_xirr
 
 st.set_page_config(page_title="ICICI XIRR", layout="wide")
@@ -18,17 +19,26 @@ st.caption("Parse quarterly transaction-statement PDFs + portfolio XLS to comput
 
 folder = st.text_input("Folder containing transaction statement PDFs", value="/Users/anmol/Downloads")
 xls_file = st.file_uploader("Portfolio XLS (current holdings)", type=["xls", "xlsx"])
+rebuild = st.checkbox("Rebuild from scratch (clear cached data)", value=False)
+
+db_path = os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")
+store = SQLiteStore(db_path)
 
 if st.button("Run analysis", type="primary"):
     if not os.path.isdir(folder):
         st.error("Folder not found.")
         st.stop()
-    transactions = parse_folder(folder)
+    if rebuild:
+        store.clear()
+        st.info("Cache cleared.")
+    known_before = len(store.known_files())
+    transactions = parse_folder(folder, store=store)
+    new_files = len(store.known_files()) - known_before
     if not transactions:
         st.error("No transactions parsed from PDFs in folder.")
         st.stop()
     tx_df = pd.DataFrame(transactions)
-    st.success(f"Parsed {len(tx_df)} transactions from {tx_df['source_file'].nunique()} PDF(s).")
+    st.success(f"Parsed {len(tx_df)} transactions. New files this run: {max(new_files,0)}. Total cached files: {len(store.known_files())}.")
 
     holdings = None
     if xls_file is not None:
