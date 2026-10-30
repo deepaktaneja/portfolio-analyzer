@@ -1,6 +1,8 @@
 import os
-import tempfile
 import shutil
+from pathlib import Path
+
+import pytest
 
 from src.pdf_parser import parse_folder, parse_pdf
 from src.store import SQLiteStore
@@ -8,7 +10,13 @@ from src.store import SQLiteStore
 SAMPLE = "/Users/anmol/Downloads/TRX-Equity_10-07-2025_982490.pdf"
 
 
+def _skip_if_missing():
+    if not Path(SAMPLE).exists():
+        pytest.skip(f"Sample PDF not found: {SAMPLE}")
+
+
 def test_incremental_parse_skips_cached(tmp_path):
+    _skip_if_missing()
     folder = tmp_path / "stmts"
     folder.mkdir()
     shutil.copy(SAMPLE, folder / "TRX-Equity_10-07-2025_982490.pdf")
@@ -24,6 +32,7 @@ def test_incremental_parse_skips_cached(tmp_path):
 
 
 def test_parse_sample_pdf():
+    _skip_if_missing()
     rows = parse_pdf(SAMPLE)
     assert len(rows) > 0
     r = rows[0]
@@ -35,6 +44,7 @@ def test_parse_sample_pdf():
 
 
 def test_discover_and_parse_folder():
+    _skip_if_missing()
     folder = os.path.dirname(SAMPLE)
     rows = parse_folder(folder)
     # At least the sample file's rows

@@ -54,18 +54,18 @@ def _read_sheets(path: str) -> dict:
     """Read a portfolio file into a dict of sheet-name -> DataFrame."""
     try:
         return pd.read_excel(path, sheet_name=None, engine="openpyxl")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         return pd.read_excel(path, sheet_name=None)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     for sep in ("\t", ","):
         try:
             df = pd.read_csv(path, sep=sep, engine="python")
             if df is not None and df.shape[1] > 1:
                 return {"Sheet1": df}
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
     raise ValueError(f"Could not read portfolio file: {path}")
 
@@ -114,7 +114,7 @@ def load_holdings(path: str | os.PathLike) -> pd.DataFrame:
 
     try:
         sheets = _read_sheets(str(path))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise ValueError(f"Could not read portfolio file {path}: {e}")
     best = None
     best_score = -1

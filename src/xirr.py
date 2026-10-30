@@ -1,8 +1,8 @@
 """XIRR calculation helpers."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, datetime
-from typing import Iterable
 
 import pandas as pd
 from pyxirr import xirr as _pyxirr_xirr
@@ -52,7 +52,7 @@ def compute_xirr(cashflows: Iterable[tuple]) -> float | None:
 
         if math.isnan(result) or math.isinf(result):
             return None
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110
         pass
     return float(result)
 

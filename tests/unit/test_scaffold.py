@@ -1,4 +1,3 @@
-from app.main import main
 from models.db import Base, get_session
 from models.schemas import HealthCheck
 

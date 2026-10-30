@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 
 class SQLiteStore:
@@ -92,7 +91,7 @@ class SQLiteStore:
                      mtime=excluded.mtime,
                      parsed_at=excluded.parsed_at,
                      row_count=excluded.row_count""",
-                (filename, mtime, datetime.now(timezone.utc).isoformat(), row_count),
+                (filename, mtime, datetime.now(UTC).isoformat(), row_count),
             )
             conn.commit()
 

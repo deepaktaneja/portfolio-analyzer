@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import os
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from pathlib import Path
-
-from src.holdings import current_value_for, discover_portfolio_files, load_holdings
-from src.pdf_parser import detect_duplicate_details, detect_missing_quarters, filter_transactions_with_buy_details, parse_folder
+from src.holdings import current_value_for, load_holdings
+from src.pdf_parser import (
+    detect_duplicate_details,
+    detect_missing_quarters,
+    filter_transactions_with_buy_details,
+    parse_folder,
+)
 from src.reconcile import reconcile
 from src.store import SQLiteStore
 from src.xirr import annualize_pct, compute_xirr
@@ -90,12 +94,8 @@ if st.button("Run analysis", type="primary"):
         if isins_ignored:
             st.info("Affected ISINs: " + ", ".join(isins_ignored))
     transactions = filtered_tx
-    # Apply XIRR start date
-    if start_date is not None:
-        transactions = [
-            t for t in transactions
-            if t.get("settlement_date") and pd.to_datetime(t["settlement_date"]).date() >= start_date
-        ]
+    # Keep all parsed transactions for XIRR; dropping pre-start-date buys while
+    # retaining the full terminal (current) value would distort returns.
     if not transactions:
         st.error("No valid transactions remain after removing duplicate/overlapping files.")
         st.stop()
@@ -106,7 +106,7 @@ if st.button("Run analysis", type="primary"):
         try:
             holdings = load_holdings(portfolio_folder)
             st.info(f"Loaded {len(holdings)} holdings from portfolio folder.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             st.warning(f"Could not load holdings from portfolio folder: {e}")
     if holdings is None and xls_file is not None:
         tmp = "/tmp/_portfolio.xls"
@@ -117,7 +117,7 @@ if st.button("Run analysis", type="primary"):
 
     # Build per-ISIN cash flows
     analysis_date = date.today()
-    isins = sorted(set(t["isin"] for t in transactions if t.get("isin")))
+    isins = sorted({t["isin"] for t in transactions if t.get("isin")})
     rows = []
     all_flows: list[tuple] = []
     for isin in isins:

@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-DATABASE_URL = os.getenv("ICICI_XIRR_DB_PATH", "sqlite:///data/portfolio.sqlite3")
+DATABASE_URL = os.getenv("ICICI_XIRR_DB_PATH", "sqlite:///data/xirr.sqlite3")
 
 
 class Base(DeclarativeBase):

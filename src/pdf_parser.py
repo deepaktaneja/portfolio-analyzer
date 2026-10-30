@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import pdfplumber
-from collections import defaultdict
 
 SETTLEMENT_ALIASES = {"settlementdate", "settlement date", "sett date", "settdate"}
 ISIN_ALIASES = {"isin", "isincode", "isin number"}
@@ -141,9 +140,7 @@ def discover_pdfs(folder: str) -> list[str]:
     return files
 
 
-import os
-from pathlib import Path
-from typing import Any, Optional
+
 
 # ... keep imports; add store import lazily to avoid circular
 def parse_folder(folder: str, store=None) -> list[dict]:
@@ -160,20 +157,25 @@ def parse_folder(folder: str, store=None) -> list[dict]:
             continue
         try:
             rows = parse_pdf(pdf)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S112
             continue
         if store is not None:
             store.replace_file_transactions(name, rows)
             store.upsert_file(name, mtime, len(rows))
         all_rows.extend(rows)
     if store is not None:
+        # Remove stale entries for PDFs that no longer exist in the folder.
+        present = {Path(pdf).name for pdf in discover_pdfs(folder)}
+        for stale in list(known):
+            if stale not in present:
+                store.remove_file(stale)
         return store.all_transactions()
     # fallback: re-parse everything (no store)
     if not all_rows:
         for pdf in discover_pdfs(folder):
             try:
                 all_rows.extend(parse_pdf(pdf))
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112
                 continue
     all_rows.sort(key=lambda r: (r.get("settlement_date") or "9999", r.get("isin") or ""))
     return all_rows
@@ -240,10 +242,7 @@ def detect_duplicate_details(transactions: list[dict]) -> list[dict]:
                 other_info = file_keys[other].get(key)
                 if not other_info:
                     continue
-                if info["min"] <= other_info["max"] and other_info["min"] <= info["max"]:
-                    conflicts.add(other)
-                    keys.add(key)
-                elif info["dates"] & other_info["dates"]:
+                if info["min"] <= other_info["max"] and other_info["min"] <= info["max"] or info["dates"] & other_info["dates"]:
                     conflicts.add(other)
                     keys.add(key)
         if conflicts:
