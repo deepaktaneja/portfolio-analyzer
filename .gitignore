@@ -4,7 +4,9 @@ __pycache__/
 .pytest_cache/
 .env
 data/
-reports/
+reports/*
+!reports/__init__.py
+!reports/exports.py
 *.db
 *.sqlite
 *.sqlite3
