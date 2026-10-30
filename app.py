@@ -1,223 +1,118 @@
-"""ICICI Direct XIRR calculator app."""
+"""ICICI Direct portfolio dashboard (Stage 09)."""
 from __future__ import annotations
-
-import os
-from datetime import date
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from src.holdings import current_value_for, load_holdings
-from src.pdf_parser import (
-    detect_duplicate_details,
-    detect_missing_quarters,
-    filter_transactions_with_buy_details,
-    parse_folder,
+from app.shared import (
+    inr,
+    load_holdings_df,
+    load_transactions,
+    price_lookup_factory,
 )
-from src.reconcile import reconcile
-from src.store import SQLiteStore
-from src.xirr import annualize_pct, compute_xirr
 
-st.set_page_config(page_title="ICICI XIRR", layout="wide")
-st.title("ICICI Direct XIRR Calculator")
-st.caption("Parse quarterly transaction-statement PDFs + portfolio XLS to compute XIRR.")
+st.set_page_config(page_title="ICICI Portfolio Analyzer", layout="wide")
+st.title("ICICI Direct Portfolio Analyzer")
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# Global filters
+with st.sidebar:
+    st.header("Filters")
+    start_date = st.date_input("Start date", value=None)
+    end_date = st.date_input("End date", value=None)
+    stock_status = st.selectbox("Stocks", ["all", "current", "exited"], index=0)
+    div_mode = st.selectbox("Dividend view", ["gross", "net"], index=0)
 
+# Load data
+if "txs" not in st.session_state:
+    st.session_state["txs"] = load_transactions()
+if "holdings" not in st.session_state:
+    st.session_state["holdings"] = load_holdings_df()
+txs = st.session_state["txs"]
+holdings = st.session_state["holdings"]
+pl = price_lookup_factory()
 
-def _default_statement_folder() -> str:
-    return str((DATA_DIR / "statements").resolve())
+tabs = st.tabs(["Overview", "Stock Analysis", "Annual Performance", "Benchmark Analysis", "Gains & Dividends", "Data Management"])
 
-
-def _point_to_point_pct(flows: list[tuple]) -> float | None:
-    invested = sum(-f[1] for f in flows if f[1] < 0)
-    proceeds = sum(f[1] for f in flows if f[1] > 0)
-    if invested <= 0:
-        return None
-    return round((proceeds / invested - 1) * 100, 2)
-
-
-def _default_portfolio_folder() -> str:
-    return str((DATA_DIR / "portfolio").resolve())
-
-
-folder = st.text_input("Folder containing transaction statement PDFs", value=_default_statement_folder())
-portfolio_folder = st.text_input("Folder containing portfolio files (XLS/XLSX)", value=_default_portfolio_folder())
-xls_file = st.file_uploader("Portfolio XLS (current holdings) - optional override", type=["xls", "xlsx"])
-start_date = st.date_input("XIRR start date", value=date(2020, 1, 1))
-rebuild = st.checkbox("Rebuild from scratch (clear cached data)", value=False)
-preview_only = st.checkbox("Preview only (do not commit to database)", value=False)
-
-db_path = os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")
-store = SQLiteStore(db_path)
-
-if st.button("Run analysis", type="primary"):
-    if not os.path.isdir(folder):
-        st.error("Folder not found.")
-        st.stop()
-    if rebuild:
-        store.clear()
-        st.info("Cache cleared.")
-    if preview_only:
-        known_before = len(store.known_files())
-        transactions = parse_folder(folder)
-        new_files = 0
-    else:
-        known_before = len(store.known_files())
-        transactions = parse_folder(folder, store=store)
-        new_files = len(store.known_files()) - known_before
-    if not transactions:
-        st.error("No transactions parsed from PDFs in folder.")
-        st.stop()
-    tx_df = pd.DataFrame(transactions)
-    rejected = [t for t in transactions if t.get("issues")]
-    if rejected:
-        st.warning(f"{len(rejected)} rows flagged with issues.")
-        st.dataframe(pd.DataFrame(rejected)[["page_number", "row_index", "isin", "issues"]], hide_index=True)
-    if preview_only:
-        st.info(f"Preview: {len(tx_df)} transactions (not committed).")
-    else:
-        st.success(f"Parsed {len(tx_df)} transactions. New files this run: {max(new_files,0)}. Total cached files: {len(store.known_files())}.")
-
-    # Validate quarters and overlapping/duplicate statement files.
-    duplicate_info = detect_duplicate_details(transactions)
-    ignored_files = sorted({d["ignored_file"] for d in duplicate_info})
-    if ignored_files:
-        st.warning("Sorted ignored duplicate/overlapping files: " + ", ".join(ignored_files))
-        for d in duplicate_info:
-            st.warning(
-                f"Ignored file {d['ignored_file']} "
-                f"(overlaps with {', '.join(d['conflicts_with'])} "
-                f"for {', '.join(d['keys'])})"
-            )
-        ignored_set = set(ignored_files)
-        for f in ignored_files:
-            store.remove_file(f)
-        transactions = [t for t in transactions if t.get("source_file") not in ignored_set]
-    missing = detect_missing_quarters(transactions)
-    if missing:
-        st.warning("Missing transactions for quarters: " + ", ".join(missing))
-    # Ignore sells without matching buy details
-    filtered_tx, ignored_buy = filter_transactions_with_buy_details(transactions)
-    if ignored_buy:
-        st.warning(f"Ignored {len(ignored_buy)} transactions without matching buy details.")
-        isins_ignored = sorted({t.get('isin') for t in ignored_buy if t.get('isin')})
-        if isins_ignored:
-            st.info("Affected ISINs: " + ", ".join(isins_ignored))
-    transactions = filtered_tx
-    # Keep all parsed transactions for XIRR; dropping pre-start-date buys while
-    # retaining the full terminal (current) value would distort returns.
-    if not transactions:
-        st.error("No valid transactions remain after removing duplicate/overlapping files.")
-        st.stop()
-    tx_df = pd.DataFrame(transactions)
-
-    holdings = None
-    if os.path.isdir(portfolio_folder):
-        try:
-            holdings = load_holdings(portfolio_folder)
-            st.info(f"Loaded {len(holdings)} holdings from portfolio folder.")
-        except Exception as e:  # noqa: BLE001
-            st.warning(f"Could not load holdings from portfolio folder: {e}")
-    if holdings is None and xls_file is not None:
-        tmp = "/tmp/_portfolio.xls"
-        with open(tmp, "wb") as f:
-            f.write(xls_file.read())
-        holdings = load_holdings(tmp)
-        st.info(f"Loaded {len(holdings)} holdings from uploaded XLS.")
-
-    # Build per-ISIN cash flows
-    analysis_date = date.today()
-    isins = sorted({t["isin"] for t in transactions if t.get("isin")})
-    rows = []
-    all_flows: list[tuple] = []
-    for isin in isins:
-        flows: list[tuple] = []
-        for t in transactions:
-            if t["isin"] != isin:
-                continue
-            if t["settlement_date"] is None or t["net_amount"] is None:
-                continue
-            amt = float(t["net_amount"])
-            if t["buy_sell"] == "BUY":
-                flows.append((t["settlement_date"], -amt))
-            elif t["buy_sell"] == "SELL":
-                flows.append((t["settlement_date"], amt))
-        # terminal value from holdings
-        terminal = None
-        symbol = None
-        if holdings is not None:
-            hrow = holdings[holdings["isin"] == isin]
-            if not hrow.empty:
-                r = hrow.iloc[0]
-                symbol = r.get("symbol")
-                terminal = current_value_for(r.to_dict())
-        if symbol is None:
-            sec_rows = [t for t in transactions if t.get("isin") == isin and t.get("security")]
-            if sec_rows:
-                symbol = sec_rows[0].get("security")
-        if terminal is not None:
-            flows.append((analysis_date, terminal))
-        x = compute_xirr(flows)
-        # totals
-        bought = sum(-f[1] for f in flows if f[1] < 0)
-        sold = sum(f[1] for f in flows if f[1] > 0 and f[0] != analysis_date)
-        terminal_val = terminal or 0
-        rows.append({
-            "ISIN": isin,
-            "Symbol": symbol,
-            "Transactions": sum(1 for t in transactions if t["isin"] == isin),
-            "Bought (Rs)": round(bought, 2),
-            "Sold (Rs)": round(sold, 2),
-            "Terminal value (Rs)": round(terminal_val, 2),
-            "XIRR (%)": annualize_pct(x),
-         "Point-to-point (%)": _point_to_point_pct(flows),
-        })
-        all_flows.extend(flows)
-
-    # Portfolio XIRR: aggregate all flows (terminal values already included per ISIN)
-    port_x = compute_xirr(all_flows)
-
-    # Annual point-to-point XIRR (calendar years)
-    from collections import defaultdict
-
-    annual_flows: dict = defaultdict(list)
-    for d, amt in all_flows:
-        annual_flows[pd.to_datetime(d).year].append((d, amt))
-    annual_rows = []
-    for y in range(2020, 2027):
-        fy = annual_flows.get(y, [])
-        annual_rows.append({
-            "Year": y,
-            "XIRR (%)": annualize_pct(compute_xirr(fy)),
-            "Point-to-point (%)": _point_to_point_pct(fy),
-            "Flows": len(fy),
-        })
-    annual_df = pd.DataFrame(annual_rows)
-
-    # Display
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Portfolio XIRR", f"{annualize_pct(port_x)}%" if port_x is not None else "N/A")
-    col2.metric("Securities", len(isins))
-    col3.metric("Portfolio point-to-point", f"{_point_to_point_pct(all_flows)}%" if _point_to_point_pct(all_flows) is not None else "N/A")
-
-    res_df = pd.DataFrame(rows)
-    st.dataframe(res_df, hide_index=True, width="stretch")
-    st.download_button("Download CSV", data=res_df.to_csv(index=False), file_name="xirr_results.csv", mime="text/csv")
-
-    with st.expander("Annual point-to-point XIRR (calendar years)"):
-        st.dataframe(annual_df, hide_index=True, width="stretch")
-
-    # Reconciliation
+# Overview
+tab = tabs[0]
+with tab:
+    st.subheader("Overview")
+    total_val = 0.0
+    if holdings is not None and not holdings.empty:
+        for _, r in holdings.iterrows():
+            cv = r.get("current_value")
+            if cv is not None:
+                total_val += float(cv)
+    st.metric("Current Portfolio Value", inr(total_val))
+    st.metric("Transactions", len(txs))
+    st.metric("Securities", len({t.get("isin") for t in txs if t.get("isin")}))
     if holdings is not None:
-        mism = reconcile(transactions, holdings)
+        st.dataframe(holdings, hide_index=True, width="stretch")
+
+# Stock Analysis
+tab = tabs[1]
+with tab:
+    st.subheader("Stock Analysis")
+    isins = sorted({t.get("isin") for t in txs if t.get("isin")})
+    sel = st.selectbox("Stock", isins) if isins else None
+    if sel:
+        from accounting.fifo import get_stock_profit_summary
+        from ledger.positions import get_stock_quantity, get_transaction_history
+        from performance.xirr import calculate_stock_xirr
+        hist = get_transaction_history(txs, sel)
+        st.dataframe(pd.DataFrame(hist), hide_index=True, width="stretch")
+        qty = get_stock_quantity(txs, sel, "2099-12-31")
+        st.metric("Current Quantity", qty)
+        res = calculate_stock_xirr(txs, security_id=sel, end_date="2025-01-01", price_lookup=pl)
+        st.metric("Stock XIRR", str(res.get("xirr")))
+        summary = get_stock_profit_summary(txs, security_id=sel, as_of_date="2025-01-01", price_lookup=pl)
+        st.json(summary)
+
+# Annual Performance
+tab = tabs[2]
+with tab:
+    st.subheader("Annual Performance")
+    from performance.benchmarks import calculate_annual_returns
+    rows = calculate_annual_returns(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", frequency="calendar")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+# Benchmark Analysis
+tab = tabs[3]
+with tab:
+    st.subheader("Benchmark Analysis")
+    from performance.benchmarks import compare_portfolio_benchmarks
+    res = compare_portfolio_benchmarks(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31")
+    st.json(res)
+
+# Gains & Dividends
+tab = tabs[4]
+with tab:
+    st.subheader("Gains & Dividends")
+    from accounting.fifo import calculate_realized_gains, calculate_unrealized_gains
+    rg = calculate_realized_gains(txs, start_date="2024-01-01", end_date="2024-12-31")
+    ug = calculate_unrealized_gains(txs, as_of_date="2025-01-01", price_lookup=pl)
+    st.dataframe(pd.DataFrame(rg), hide_index=True, width="stretch")
+    st.dataframe(pd.DataFrame(ug), hide_index=True, width="stretch")
+
+# Data Management
+tab = tabs[5]
+with tab:
+    st.subheader("Data Management")
+    st.write("Transactions loaded:", len(txs))
+    st.write("Holdings:", 0 if holdings is None else len(holdings))
+    from src.pdf_parser import detect_duplicate_details, detect_missing_quarters
+    missing = detect_missing_quarters(txs)
+    if missing:
+        st.warning("Missing quarters: " + ", ".join(missing))
+    dup = detect_duplicate_details(txs)
+    if dup:
+        st.warning("Duplicate/overlapping files detected.")
+        st.dataframe(pd.DataFrame(dup), hide_index=True, width="stretch")
+    from src.reconcile import reconcile
+    if holdings is not None:
+        mism = reconcile(txs, holdings)
         if mism:
-            st.subheader("Holdings reconciliation mismatches")
+            st.warning("Reconciliation mismatches found.")
             st.dataframe(pd.DataFrame(mism), hide_index=True, width="stretch")
         else:
-            st.success("Holdings reconcile with transaction statements.")
-
-    with st.expander("Raw parsed transactions"):
-        st.dataframe(tx_df, hide_index=True, width="stretch")
+            st.success("Holdings reconcile.")
