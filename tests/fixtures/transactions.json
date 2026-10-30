@@ -1,0 +1,37 @@
+[
+  {
+    "trade_date": "2018-01-10",
+    "isin": "INEA",
+    "buy_sell": "BUY",
+    "quantity": 10,
+    "net_amount": 1000.0
+  },
+  {
+    "trade_date": "2019-03-01",
+    "isin": "INEA",
+    "buy_sell": "BUY",
+    "quantity": 5,
+    "net_amount": 600.0
+  },
+  {
+    "trade_date": "2020-06-01",
+    "isin": "INEA",
+    "buy_sell": "SELL",
+    "quantity": 7,
+    "net_amount": 900.0
+  },
+  {
+    "trade_date": "2021-01-01",
+    "isin": "INEA",
+    "buy_sell": "SELL",
+    "quantity": 8,
+    "net_amount": 1200.0
+  },
+  {
+    "trade_date": "2022-01-01",
+    "isin": "INEA",
+    "buy_sell": "BUY",
+    "quantity": 3,
+    "net_amount": 400.0
+  }
+]

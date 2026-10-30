@@ -1,24 +1,13 @@
 # Implementation Status
 
-## Stage 00 - Project scaffolding
+## Stage 11 - End-to-end testing and local release
 
 Status: Implemented
 
 Completed:
-- Repository directory skeleton
-- Package placeholders
-- SQLAlchemy base and session scaffolding
-- Alembic configuration and initial empty migration
-- Pydantic health-check schema
-- Basic Streamlit entry point
-- Documentation placeholders
+- Synthetic fixtures and end-to-end tests
+- Documentation and release checklist
+- Full test suite and linting
 
-Not yet implemented:
-- PDF import
-- XLS import
-- Database domain models
-- Ledger and FIFO accounting
-- Corporate actions
-- Dividends
-- Performance calculations
-- Reports and charts
+Remaining:
+- Production readiness not claimed.
