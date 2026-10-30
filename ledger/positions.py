@@ -31,7 +31,10 @@ def _qty(t: dict) -> float:
     q = t.get("quantity")
     if q is None:
         return 0.0
-    return float(q)
+    try:
+        return float(q)
+    except (TypeError, ValueError):
+        return 0.0
 
 def _event_type(t: dict) -> str:
     return str(t.get("event_type") or t.get("type") or "trade").strip().lower()
@@ -124,7 +127,8 @@ def reconcile_holdings(transactions, snapshot_date, snapshot, date_basis: str = 
             isin = str(row.get("isin") or row.get("security") or "").strip().upper()
             if not isin:
                 continue
-            snap_map[isin] = float(row.get("quantity") or row.get("qty") or 0)
+            qv = row.get("quantity", row.get("qty"))
+            snap_map[isin] = float(qv) if qv is not None else 0.0
             if row.get("symbol") or row.get("security"):
                 snap_symbol[isin] = str(row.get("symbol") or row.get("security")).strip()
     all_isins = set(recon) | set(snap_map)
