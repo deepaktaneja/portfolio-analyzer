@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pdfplumber
+from collections import defaultdict
 
 SETTLEMENT_ALIASES = {"settlementdate", "settlement date", "sett date", "settdate"}
 ISIN_ALIASES = {"isin", "isincode", "isin number"}
@@ -176,3 +177,123 @@ def parse_folder(folder: str, store=None) -> list[dict]:
                 continue
     all_rows.sort(key=lambda r: (r.get("settlement_date") or "9999", r.get("isin") or ""))
     return all_rows
+
+
+def _quarter_label(date_str: str) -> str:
+    y, m = date_str.split("-")[:2]
+    q = (int(m) - 1) // 3 + 1
+    return f"{y} Q{q}"
+
+
+def _quarter_key(label: str) -> tuple[int, int]:
+    y, q = label.split()
+    return (int(y), int(q[1:]))
+
+
+def detect_missing_quarters(transactions: list[dict]) -> list[str]:
+    """Return quarter labels between min/max transaction quarter that have no rows."""
+    present: set[str] = set()
+    for t in transactions or []:
+        d = t.get("settlement_date")
+        if d:
+            present.add(_quarter_label(str(d)))
+    if not present:
+        return []
+    min_label = min(present, key=_quarter_key)
+    max_label = max(present, key=_quarter_key)
+    expected: list[str] = []
+    y, q = _quarter_key(min_label)
+    end_y, end_q = _quarter_key(max_label)
+    while (y, q) <= (end_y, end_q):
+        expected.append(f"{y} Q{q}")
+        q += 1
+        if q > 4:
+            q = 1
+            y += 1
+    return sorted([q for q in expected if q not in present], key=_quarter_key)
+
+
+def detect_duplicate_details(transactions: list[dict]) -> list[dict]:
+    """Detect files whose ISIN/security date ranges overlap with earlier files."""
+    file_keys: dict[str, dict[str, dict]] = {}
+    for t in transactions or []:
+        f = t.get("source_file")
+        key = t.get("isin") or t.get("security")
+        d = t.get("settlement_date")
+        if not f or not key or not d:
+            continue
+        d = str(d)
+        bucket = file_keys.setdefault(f, {}).setdefault(
+            key, {"min": d, "max": d, "dates": {d}}
+        )
+        bucket["min"] = min(bucket["min"], d)
+        bucket["max"] = max(bucket["max"], d)
+        bucket["dates"].add(d)
+
+    files = sorted(file_keys)
+    details: list[dict] = []
+    for i, f in enumerate(files):
+        conflicts: set[str] = set()
+        keys: set[str] = set()
+        for key, info in file_keys[f].items():
+            for other in files[:i]:
+                other_info = file_keys[other].get(key)
+                if not other_info:
+                    continue
+                if info["min"] <= other_info["max"] and other_info["min"] <= info["max"]:
+                    conflicts.add(other)
+                    keys.add(key)
+                elif info["dates"] & other_info["dates"]:
+                    conflicts.add(other)
+                    keys.add(key)
+        if conflicts:
+            details.append(
+                {
+                    "ignored_file": f,
+                    "conflicts_with": sorted(conflicts),
+                    "keys": sorted(keys),
+                }
+            )
+    details.sort(key=lambda d: d["ignored_file"])
+    return details
+
+
+def detect_duplicate_files(transactions: list[dict]) -> list[str]:
+    return sorted({d["ignored_file"] for d in detect_duplicate_details(transactions)})
+
+
+def filter_transactions_with_buy_details(transactions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Keep sells only when a matching earlier buy exists for the same ISIN."""
+    buys_by_isin: dict[str, list[str]] = {}
+    for t in transactions or []:
+        if t.get("buy_sell") == "BUY" and t.get("isin") and t.get("settlement_date"):
+            buys_by_isin.setdefault(t["isin"], []).append(str(t["settlement_date"]))
+
+    filtered: list[dict] = []
+    ignored: list[dict] = []
+    for t in transactions or []:
+        if t.get("buy_sell") != "SELL":
+            filtered.append(t)
+            continue
+        isin = t.get("isin")
+        sell_date = t.get("settlement_date")
+        buy_dates = buys_by_isin.get(isin, [])
+        if sell_date and any(bd <= str(sell_date) for bd in buy_dates):
+            filtered.append(t)
+        else:
+            ignored.append(t)
+    return filtered, ignored
+
+
+# Backwards/alternative names for the statement folder helpers.
+discover_statements = discover_pdfs
+discover_statement_pdfs = discover_pdfs
+discover_statement_files = discover_pdfs
+parse_statements = parse_folder
+parse_statement_folder = parse_folder
+
+# Validation aliases
+missing_quarters = detect_missing_quarters
+duplicate_files = detect_duplicate_files
+duplicate_details = detect_duplicate_details
+filter_buy_details = filter_transactions_with_buy_details

@@ -18,25 +18,12 @@ def reconcile(transactions: list[dict], holdings: pd.DataFrame) -> list[dict]:
         elif t.get("buy_sell") == "SELL":
             net[isin] = net.get(isin, 0) - q
     mismatches = []
-    # check XLS holdings
-    for _, row in holdings.iterrows():
-        isin = row.get("isin")
-        xls_qty = row.get("quantity")
-        if pd.isna(xls_qty):
-            continue
-        comp_qty = net.get(isin, 0)
-        if abs(comp_qty - float(xls_qty)) > 1e-6:
-            mismatches.append({
-                "isin": isin,
-                "symbol": row.get("symbol"),
-                "computed_qty": comp_qty,
-                "xls_qty": float(xls_qty),
-                "diff": comp_qty - float(xls_qty),
-            })
-    # ISINs in transactions but not in holdings
+    # Only report ISINs that are not part of the current portfolio holdings.
     holding_isins = set(str(x) for x in holdings.get("isin", []).tolist())
     for isin, q in net.items():
-        if isin not in holding_isins and abs(q) > 1e-6:
+        if isin in holding_isins:
+            continue
+        if abs(q) > 1e-6:
             mismatches.append({
                 "isin": isin,
                 "symbol": None,

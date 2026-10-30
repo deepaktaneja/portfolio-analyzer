@@ -16,10 +16,13 @@ pip install -r requirements.txt
 ## Usage
 
 1. Download quarterly Equity Transaction Statements from ICICI Direct
-   (Stocks > Reports > Equity Transaction statement) as PDFs into a folder.
-2. Export your portfolio summary as XLS.
+   (Stocks > Reports > Equity Transaction statement) as PDFs into the
+   `data/statements` folder.
+2. Export your portfolio summary as XLS/XLSX (or TSV) into the
+   `data/portfolio` folder.
 3. Run: `streamlit run app.py`
-4. Enter the folder path, upload the XLS, click "Run analysis".
+4. The app reads statement PDFs from the statements folder and holdings
+   from the portfolio folder. Click "Run analysis".
 
 ## Tests
 
