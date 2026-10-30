@@ -7,7 +7,7 @@ import pytest
 from src.pdf_parser import parse_folder, parse_pdf
 from src.store import SQLiteStore
 
-SAMPLE = "/Users/anmol/Downloads/TRX-Equity_10-07-2025_982490.pdf"
+SAMPLE = "data/statements/TRX-Equity_05-04-2018_277508.pdf"
 
 
 def _skip_if_missing():
