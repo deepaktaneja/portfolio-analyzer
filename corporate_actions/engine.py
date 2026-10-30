@@ -97,7 +97,7 @@ def _apply_action(lots, action: CorporateAction, review: list):
         ratio = float(action.ratio or 1.0)
         for lot in affected:
             lot["qty"] *= ratio
-    elif et == "bonus":
+    elif et in ("bonus", "stock_dividend", "stock dividend"):
         ratio = float(action.ratio or 0.0)
         for lot in list(affected):
             lots.append({"isin": isin, "qty": lot["qty"] * ratio, "cost": 0.0, "date": credit, "source": "bonus"})

@@ -87,3 +87,9 @@ def test_holdings_before_action():
     actions = [CorporateAction(security_id="INE8", event_type="split", effective_date=date(2020,1,1), ratio=2.0, verified=True)]
     qty, _ = reconstruct_with_actions(tx, actions, date(2019,6,1))
     assert qty["INE8"] == 10
+
+def test_stock_dividend():
+    tx = [{"trade_date": "2019-01-01", "isin": "INE9", "buy_sell": "BUY", "quantity": 10, "net_amount": 1000.0}]
+    actions = [CorporateAction(security_id="INE9", event_type="stock_dividend", effective_date=date(2020,1,1), ratio=0.1, verified=True)]
+    qty, _ = reconstruct_with_actions(tx, actions, date(2020,2,1))
+    assert qty["INE9"] == 11
