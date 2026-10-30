@@ -4,9 +4,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import pandas as pd
-import streamlit as st
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
@@ -20,8 +17,8 @@ def default_portfolio_folder() -> str:
 
 
 def load_transactions(db_path="data/xirr.sqlite3"):
-    from src.store import SQLiteStore
     from src.pdf_parser import parse_folder
+    from src.store import SQLiteStore
     store = SQLiteStore(db_path)
     txs = store.all_transactions()
     if not txs:
@@ -38,15 +35,14 @@ def load_holdings_df(folder=None):
         return None
     try:
         return load_holdings(folder)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
-
 
 def inr(value):
     if value is None:
         return "N/A"
     try:
-        return "Rs {:,.2f}".format(float(value))
+        return f"Rs {float(value):,.2f}"
     except (TypeError, ValueError):
         return str(value)
 
