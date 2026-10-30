@@ -98,7 +98,7 @@ def reconcile_dividend_payment(expected: dict, actual) -> dict:
         "expected_gross": exp_gross,
         "actual_gross": ag,
         "tds": float(actual.tds or 0.0),
-        "net_credit": float(actual.net if hasattr(actual, "net") else (actual.net_amount or (actual.gross_amount - actual.tds))),
+        "net_credit": float(actual.net_amount if actual.net_amount is not None else (actual.gross_amount - actual.tds)),
         "difference": diff,
         "status": status,
     }
@@ -117,10 +117,8 @@ def get_stock_dividend_cashflows(events, credits, security_id=None, verified_onl
             continue
         credit = creds.get((sid, e.ex_date))
         if credit is None:
-            if verified_only:
-                continue
-            pay_date = e.payment_date or e.ex_date
-            gross = float(e.dividend_per_share or 0.0)
+            # No verified credit available; never emit an unverified cash flow.
+            continue
         else:
             if verified_only and getattr(credit, "status", "") != "confirmed":
                 continue
