@@ -62,6 +62,10 @@ def parse_pdf(path: str) -> list[dict]:
     _raws, txs = parse_document(path)
     out = []
     for tx in txs:
+        from importers.validation import validate_transaction
+
+        issues = validate_transaction(tx)
+        tx.issues = sorted(set(tx.issues + issues))
         out.append({
             "settlement_date": tx.settlement_date,
             "trade_date": tx.trade_date,
@@ -128,8 +132,9 @@ def parse_folder(folder: str, store=None) -> list[dict]:
         except Exception:  # noqa: BLE001, S112
             continue
         if store is not None:
-            store.replace_file_transactions(name, rows)
-            store.upsert_file(name, mtime, len(rows))
+            accepted_rows = [r for r in rows if not r.get("issues")]
+            store.replace_file_transactions(name, accepted_rows)
+            store.upsert_file(name, mtime, len(accepted_rows))
         all_rows.extend(rows)
     if store is not None:
         # Remove stale entries for PDFs that no longer exist in the folder.
