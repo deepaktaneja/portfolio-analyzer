@@ -40,11 +40,66 @@ class SQLiteStore:
                     source_file TEXT NOT NULL
                 )"""
             )
+            # backfill columns for older DBs
+            for col, decl in (
+                ("trade_date", "TEXT"),
+                ("gross_rate", "REAL"),
+                ("gross_amount", "REAL"),
+                ("brokerage", "REAL"),
+                ("gst", "REAL"),
+                ("charges", "REAL"),
+                ("exchange", "TEXT"),
+                ("order_no", "TEXT"),
+                ("trade_no", "TEXT"),
+                ("page_number", "INTEGER"),
+                ("row_index", "INTEGER"),
+                ("fingerprint", "TEXT"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError:
+                    pass
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_source ON transactions(source_file)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_isin ON transactions(isin)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_fingerprint ON transactions(fingerprint)")
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tx_source ON transactions(source_file)"
+                """CREATE TABLE IF NOT EXISTS import_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    transaction_count INTEGER NOT NULL DEFAULT 0
+                )"""
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tx_isin ON transactions(isin)"
+                """CREATE TABLE IF NOT EXISTS source_documents (
+                    filename TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL,
+                    detected_type TEXT,
+                    imported_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_file TEXT NOT NULL,
+                    as_of_date TEXT,
+                    detected_type TEXT,
+                    imported_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER NOT NULL,
+                    isin TEXT,
+                    symbol TEXT,
+                    quantity REAL,
+                    avg_price REAL,
+                    current_price REAL,
+                    cost_value REAL,
+                    market_value REAL,
+                    FOREIGN KEY(snapshot_id) REFERENCES portfolio_snapshots(id)
+                )"""
             )
             conn.commit()
 
@@ -65,17 +120,31 @@ class SQLiteStore:
             conn.execute("DELETE FROM transactions WHERE source_file=?", (filename,))
             conn.executemany(
                 """INSERT INTO transactions
-                   (settlement_date, isin, security, buy_sell, quantity, net_amount, source_file)
-                   VALUES (?,?,?,?,?,?,?)""",
+                   (settlement_date, trade_date, isin, security, buy_sell, quantity,
+                    gross_rate, gross_amount, brokerage, gst, charges, net_amount,
+                    exchange, order_no, trade_no, page_number, row_index, source_file, fingerprint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         r.get("settlement_date"),
+                        r.get("trade_date"),
                         r.get("isin"),
                         r.get("security"),
                         r.get("buy_sell"),
                         r.get("quantity"),
+                        r.get("gross_rate"),
+                        r.get("gross_amount"),
+                        r.get("brokerage"),
+                        r.get("gst"),
+                        r.get("charges"),
                         r.get("net_amount"),
+                        r.get("exchange"),
+                        r.get("order_no"),
+                        r.get("trade_no"),
+                        r.get("page_number"),
+                        r.get("row_index"),
                         filename,
+                        r.get("fingerprint"),
                     )
                     for r in rows
                 ],
@@ -104,7 +173,10 @@ class SQLiteStore:
     def all_transactions(self) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT settlement_date, isin, security, buy_sell, quantity, net_amount, source_file FROM transactions"
+                """SELECT settlement_date, trade_date, isin, security, buy_sell, quantity,
+                          gross_rate, gross_amount, brokerage, gst, charges, net_amount,
+                          exchange, order_no, trade_no, page_number, row_index, source_file, fingerprint
+                   FROM transactions"""
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -113,3 +185,31 @@ class SQLiteStore:
             conn.execute("DELETE FROM transactions")
             conn.execute("DELETE FROM files")
             conn.commit()
+
+    def add_portfolio_snapshot(self, source_file: str, as_of_date: str | None, detected_type: str | None, holdings: list[dict]) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO portfolio_snapshots (source_file, as_of_date, detected_type, imported_at) VALUES (?,?,?,?)",
+                (source_file, as_of_date, detected_type, datetime.now(UTC).isoformat()),
+            )
+            sid = cur.lastrowid
+            conn.executemany(
+                """INSERT INTO portfolio_holdings
+                   (snapshot_id, isin, symbol, quantity, avg_price, current_price, cost_value, market_value)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        sid,
+                        h.get("isin"),
+                        h.get("symbol"),
+                        h.get("quantity"),
+                        h.get("avg_price"),
+                        h.get("current_price"),
+                        h.get("cost_value"),
+                        h.get("market_value"),
+                    )
+                    for h in holdings
+                ],
+            )
+            conn.commit()
+        return int(sid)

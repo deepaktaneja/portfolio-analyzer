@@ -7,8 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import pdfplumber
-
 SETTLEMENT_ALIASES = {"settlementdate", "settlement date", "sett date", "settdate"}
 ISIN_ALIASES = {"isin", "isincode", "isin number"}
 SECURITY_ALIASES = {"security", "securityname", "scripname", "scrip", "name"}
@@ -56,67 +54,37 @@ def _is_header(row: list) -> bool:
 
 
 def parse_pdf(path: str) -> list[dict]:
-    rows_out: list[dict] = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables() or []:
-                if not table:
-                    continue
-                header = None
-                for r in table:
-                    if _is_header(r):
-                        header = r
-                        break
-                if header is None:
-                    header = table[0]
-                    data_rows = table[1:]
-                else:
-                    data_rows = [r for r in table if r is not header]
-                si = _find_col(header, SETTLEMENT_ALIASES)
-                ii = _find_col(header, ISIN_ALIASES)
-                if ii is None:
-                    continue
-                sei = _find_col(header, SECURITY_ALIASES)
-                bi = _find_col(header, BUYZELL_ALIASES)
-                qi = _find_col(header, QUANTITY_ALIASES)
-                ni = _find_col(header, NET_AMOUNT_ALIASES)
-                for r in data_rows:
-                    if not r or all((c is None or str(c).strip() == "") for c in r):
-                        continue
-                    joined = " ".join(str(c or "") for c in r).lower()
-                    if "total" in joined and (ii is None or not str(r[ii] or "").strip()):
-                        continue
-                    isin = str(r[ii]).strip().upper() if ii is not None and r[ii] is not None else ""
-                    if not isin or not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin):
-                        continue
-                    bs_raw = str(r[bi]).strip().upper() if bi is not None and r[bi] is not None else ""
-                    if bs_raw in ("B", "BUY", "B/S"):
-                        bs = "BUY"
-                    elif bs_raw in ("S", "SELL"):
-                        bs = "SELL"
-                    else:
-                        bs = bs_raw
-                    try:
-                        qty = float(str(r[qi]).replace(",", "").strip()) if qi is not None and r[qi] is not None else None
-                    except ValueError:
-                        qty = None
-                    try:
-                        net = float(str(r[ni]).replace(",", "").strip()) if ni is not None and r[ni] is not None else None
-                    except ValueError:
-                        net = None
-                    sec = str(r[sei]).strip().replace("\n", " ") if sei is not None and r[sei] is not None else ""
-                    sett = _parse_date(r[si]) if si is not None else None
-                    rows_out.append({
-                        "settlement_date": sett,
-                        "isin": isin,
-                        "security": sec,
-                        "buy_sell": bs,
-                        "quantity": qty,
-                        "net_amount": net,
-                        "source_file": Path(path).name,
-                    })
-    return rows_out
+    from importers.detection import detect_pdf
+    from importers.pdf.icici_equity import parse_document
 
+    if detect_pdf(path) == "pdf_scanned":
+        return []
+    _raws, txs = parse_document(path)
+    out = []
+    for tx in txs:
+        out.append({
+            "settlement_date": tx.settlement_date,
+            "trade_date": tx.trade_date,
+            "isin": tx.isin,
+            "security": tx.security,
+            "buy_sell": tx.side,
+            "quantity": tx.quantity,
+            "gross_rate": tx.gross_rate,
+            "gross_amount": tx.gross_amount,
+            "brokerage": tx.brokerage,
+            "gst": tx.gst,
+            "charges": tx.charges,
+            "net_amount": tx.net_amount,
+            "exchange": tx.exchange,
+            "order_no": tx.order_no,
+            "trade_no": tx.trade_no,
+            "page_number": tx.page_number,
+            "row_index": tx.row_index,
+            "source_file": tx.source_file,
+            "fingerprint": tx.fingerprint,
+            "issues": list(tx.issues),
+        })
+    return out
 
 def discover_pdfs(folder: str) -> list[str]:
     folder = Path(folder)

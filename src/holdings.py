@@ -112,28 +112,26 @@ def load_holdings(path: str | os.PathLike) -> pd.DataFrame:
             raise ValueError(f"No portfolio files found in folder: {path}")
         path = files[0]
 
-    try:
-        sheets = _read_sheets(str(path))
-    except Exception as e:  # noqa: BLE001
-        raise ValueError(f"Could not read portfolio file {path}: {e}")
-    best = None
-    best_score = -1
-    for name, df in (sheets or {}).items():
-        m = _detect_columns(df)
-        if len(m) > best_score:
-            best_score = len(m)
-            best = (name, df, m)
-    if best is None:
-        raise ValueError("No sheets found in portfolio file")
-    _, df, mapping = best
+    from importers.xls.icici_portfolio import parse_portfolio
+
+    df, meta = parse_portfolio(str(path))
     out = pd.DataFrame()
-    for field in ("isin", "symbol", "quantity", "avg_price", "current_value", "current_price"):
-        if field in mapping:
-            out[field] = df[mapping[field]]
-        else:
-            out[field] = None
+    out["isin"] = df.get("isin")
+    out["symbol"] = df.get("symbol")
+    if "security" in df.columns:
+        out["symbol"] = out["symbol"].fillna(df.get("security"))
+    out["quantity"] = df.get("quantity")
+    out["avg_price"] = df.get("avg_price")
+    if "market_value" in df.columns:
+        out["current_value"] = df.get("market_value")
+    elif "cost_value" in df.columns:
+        out["current_value"] = df.get("cost_value")
+    else:
+        out["current_value"] = None
+    out["current_price"] = df.get("current_price")
     if "isin" in out.columns:
         out["isin"] = out["isin"].astype(str).str.strip().str.upper()
+        out.loc[out["isin"].isin({"NAN", "NONE", "NAT"}), "isin"] = None
     if "symbol" in out.columns:
         out["symbol"] = out["symbol"].astype(str).str.strip()
         out.loc[out["symbol"].isin({"NAN", "NONE", "NAT"}), "symbol"] = None
@@ -141,8 +139,9 @@ def load_holdings(path: str | os.PathLike) -> pd.DataFrame:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out[out["isin"].notna() & (out["isin"] != "NAN") & (out["isin"] != "NONE")]
     out = out.reset_index(drop=True)
+    out.attrs["as_of_date"] = meta.get("as_of_date")
+    out.attrs["detected_type"] = meta.get("detected_type")
     return out
-
 
 # Backwards/alternative names for the portfolio folder helpers.
 discover_portfolio = discover_portfolio_files

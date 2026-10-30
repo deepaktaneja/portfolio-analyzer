@@ -48,6 +48,7 @@ portfolio_folder = st.text_input("Folder containing portfolio files (XLS/XLSX)",
 xls_file = st.file_uploader("Portfolio XLS (current holdings) - optional override", type=["xls", "xlsx"])
 start_date = st.date_input("XIRR start date", value=date(2020, 1, 1))
 rebuild = st.checkbox("Rebuild from scratch (clear cached data)", value=False)
+preview_only = st.checkbox("Preview only (do not commit to database)", value=False)
 
 db_path = os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")
 store = SQLiteStore(db_path)
@@ -59,14 +60,26 @@ if st.button("Run analysis", type="primary"):
     if rebuild:
         store.clear()
         st.info("Cache cleared.")
-    known_before = len(store.known_files())
-    transactions = parse_folder(folder, store=store)
-    new_files = len(store.known_files()) - known_before
+    if preview_only:
+        known_before = len(store.known_files())
+        transactions = parse_folder(folder)
+        new_files = 0
+    else:
+        known_before = len(store.known_files())
+        transactions = parse_folder(folder, store=store)
+        new_files = len(store.known_files()) - known_before
     if not transactions:
         st.error("No transactions parsed from PDFs in folder.")
         st.stop()
     tx_df = pd.DataFrame(transactions)
-    st.success(f"Parsed {len(tx_df)} transactions. New files this run: {max(new_files,0)}. Total cached files: {len(store.known_files())}.")
+    rejected = [t for t in transactions if t.get("issues")]
+    if rejected:
+        st.warning(f"{len(rejected)} rows flagged with issues.")
+        st.dataframe(pd.DataFrame(rejected)[["page_number", "row_index", "isin", "issues"]], hide_index=True)
+    if preview_only:
+        st.info(f"Preview: {len(tx_df)} transactions (not committed).")
+    else:
+        st.success(f"Parsed {len(tx_df)} transactions. New files this run: {max(new_files,0)}. Total cached files: {len(store.known_files())}.")
 
     # Validate quarters and overlapping/duplicate statement files.
     duplicate_info = detect_duplicate_details(transactions)
