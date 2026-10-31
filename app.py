@@ -1,6 +1,8 @@
 """ICICI Direct portfolio dashboard (Stage 09)."""
 from __future__ import annotations
 
+import os
+
 import pandas as pd
 import streamlit as st
 
@@ -59,9 +61,16 @@ with tab:
         from accounting.fifo import get_stock_profit_summary
         from ledger.positions import get_stock_quantity, get_transaction_history
         from performance.xirr import calculate_stock_xirr
+        from src.store import SQLiteStore
+        _store = SQLiteStore(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3"))
+        openings = _store.get_opening_positions()
         hist = get_transaction_history(txs, sel)
         st.dataframe(pd.DataFrame(hist), hide_index=True, width="stretch")
-        qty = get_stock_quantity(txs, sel, "2099-12-31")
+        try:
+            qty = get_stock_quantity(txs, sel, "2099-12-31", opening_positions=openings)
+        except ValueError:
+            qty = 0.0
+            st.warning("Negative holdings detected for this stock; opening position may be missing.")
         st.metric("Current Quantity", qty)
         res = calculate_stock_xirr(txs, security_id=sel, end_date="2025-01-01", price_lookup=pl)
         st.metric("Stock XIRR", str(res.get("xirr")))
@@ -98,6 +107,8 @@ with tab:
 tab = tabs[5]
 with tab:
     st.subheader("Data Management")
+    from src.store import SQLiteStore
+    store = SQLiteStore(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3"))
     st.write("Transactions loaded:", len(txs))
     st.write("Holdings:", 0 if holdings is None else len(holdings))
     from src.pdf_parser import detect_duplicate_details, detect_missing_quarters
@@ -116,3 +127,27 @@ with tab:
             st.dataframe(pd.DataFrame(mism), hide_index=True, width="stretch")
         else:
             st.success("Holdings reconcile.")
+
+    # Opening positions
+    st.subheader("Opening Positions")
+    from ledger.opening import infer_minimum_opening
+    inferred = infer_minimum_opening(txs)
+    if inferred:
+        st.warning("Missing opening holdings detected for some stocks.")
+        rows = []
+        for isin, qty in inferred.items():
+            rows.append({"Stock": isin, "Minimum Opening Qty": qty, "Status": "Provisional"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    # negative holdings
+    from ledger.positions import check_negative_holdings
+    negs = check_negative_holdings(txs, "2099-12-31")
+    if negs:
+        st.warning("Negative holdings: " + ", ".join(negs[:10]))
+
+    with st.form("opening_form"):
+        isin_in = st.text_input("ISIN")
+        qty_in = st.number_input("Opening Qty", min_value=0.0)
+        date_in = st.date_input("Ledger Opening Date")
+        if st.form_submit_button("Add Opening Position"):
+            store.add_opening_position(isin_in, str(date_in), qty_in, source="manual", verification_status="verified")
+            st.success("Opening position added.")

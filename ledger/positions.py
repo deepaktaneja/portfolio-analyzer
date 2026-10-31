@@ -58,8 +58,19 @@ def _is_trade_event(t: dict) -> bool:
         return False
     return et != "settlement"
 
-def reconstruct(transactions, as_of_date, date_basis: str = "trade") -> dict:
+def reconstruct(transactions, as_of_date, date_basis: str = "trade", opening_positions=None):
     cutoff = _to_date(as_of_date)
+    tx_list = list(transactions or [])
+    for op in (opening_positions or []):
+        try:
+            od = _to_date(op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if od <= cutoff:
+            isin = op.get("security_id") if isinstance(op, dict) else op.security_id
+            qty = op.get("opening_qty") if isinstance(op, dict) else op.opening_qty
+            tx_list.append({"trade_date": od.isoformat(), "isin": isin, "buy_sell": "OPENING", "quantity": qty, "event_type": "opening"})
+    transactions = tx_list
     relevant = []
     for t in transactions or []:
         if not _is_trade_event(t):
@@ -93,11 +104,11 @@ def reconstruct(transactions, as_of_date, date_basis: str = "trade") -> dict:
 
     return {k: v for k, v in quantities.items() if abs(v) > TOL}
 
-def get_holdings(transactions, as_of_date, date_basis: str = "trade"):
-    return reconstruct(transactions, as_of_date, date_basis)
+def get_holdings(transactions, as_of_date, date_basis: str = "trade", opening_positions=None):
+    return reconstruct(transactions, as_of_date, date_basis, opening_positions=opening_positions)
 
-def get_stock_quantity(transactions, security_id, as_of_date, date_basis: str = "trade") -> float:
-    holdings = reconstruct(transactions, as_of_date, date_basis)
+def get_stock_quantity(transactions, security_id, as_of_date, date_basis: str = "trade", opening_positions=None) -> float:
+    holdings = reconstruct(transactions, as_of_date, date_basis, opening_positions=opening_positions)
     return float(holdings.get(str(security_id).strip().upper(), 0.0))
 
 def get_transaction_history(transactions, security_id) -> list:
@@ -189,8 +200,8 @@ class TransactionLedger:
     def get_holdings(self, as_of_date, date_basis: str = "trade"):
         return get_holdings(self.transactions, as_of_date, date_basis)
 
-    def get_stock_quantity(self, security_id, as_of_date, date_basis: str = "trade") -> float:
-        return get_stock_quantity(self.transactions, security_id, as_of_date, date_basis)
+    def get_stock_quantity(self, security_id, as_of_date, date_basis: str = "trade", opening_positions=None) -> float:
+        return get_stock_quantity(self.transactions, security_id, as_of_date, date_basis, opening_positions=opening_positions)
 
     def get_transaction_history(self, security_id) -> list:
         return get_transaction_history(self.transactions, security_id)

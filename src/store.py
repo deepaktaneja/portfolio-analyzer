@@ -103,6 +103,58 @@ class SQLiteStore:
             )
             conn.commit()
 
+    def _ensure_opening_table(self) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS opening_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    security_id TEXT NOT NULL,
+                    ledger_opening_date TEXT NOT NULL,
+                    opening_qty REAL NOT NULL,
+                    original_acq_date TEXT,
+                    original_acq_cost REAL,
+                    source TEXT,
+                    verification_status TEXT NOT NULL DEFAULT 'unresolved',
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (security_id, ledger_opening_date)
+                )"""
+            )
+            conn.commit()
+
+    def add_opening_position(self, security_id, ledger_opening_date, opening_qty, original_acq_date=None, original_acq_cost=None, source=None, verification_status='unresolved', notes=None):
+        self._ensure_opening_table()
+        from datetime import datetime
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO opening_positions (security_id, ledger_opening_date, opening_qty, original_acq_date, original_acq_cost, source, verification_status, notes, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(security_id, ledger_opening_date) DO UPDATE SET
+                     opening_qty=excluded.opening_qty,
+                     original_acq_date=excluded.original_acq_date,
+                     original_acq_cost=excluded.original_acq_cost,
+                     source=excluded.source,
+                     verification_status=excluded.verification_status,
+                     notes=excluded.notes""",
+                (security_id.strip().upper(), ledger_opening_date, float(opening_qty), original_acq_date, original_acq_cost, source, verification_status, notes, datetime.now(UTC).isoformat()),
+            )
+            conn.commit()
+
+    def get_opening_positions(self, security_id=None):
+        self._ensure_opening_table()
+        with self._conn() as conn:
+            if security_id:
+                rows = conn.execute("SELECT * FROM opening_positions WHERE security_id=?", (security_id.strip().upper(),)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM opening_positions").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_opening_position(self, security_id, ledger_opening_date):
+        self._ensure_opening_table()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM opening_positions WHERE security_id=? AND ledger_opening_date=?", (security_id.strip().upper(), ledger_opening_date))
+            conn.commit()
+
     def known_files(self) -> dict[str, float]:
         with self._conn() as conn:
             rows = conn.execute("SELECT filename, mtime FROM files").fetchall()
