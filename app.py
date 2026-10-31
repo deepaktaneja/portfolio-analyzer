@@ -82,7 +82,9 @@ tab = tabs[2]
 with tab:
     st.subheader("Annual Performance")
     from performance.benchmarks import calculate_annual_returns
-    rows = calculate_annual_returns(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", frequency="calendar")
+    from src.store import SQLiteStore as _SS
+    _o = _SS(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")).get_opening_positions()
+    rows = calculate_annual_returns(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", frequency="calendar", opening_positions=_o)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 # Benchmark Analysis
@@ -90,7 +92,9 @@ tab = tabs[3]
 with tab:
     st.subheader("Benchmark Analysis")
     from performance.benchmarks import compare_portfolio_benchmarks
-    res = compare_portfolio_benchmarks(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31")
+    from src.store import SQLiteStore as _SS
+    _o = _SS(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")).get_opening_positions()
+    res = compare_portfolio_benchmarks(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", opening_positions=_o)
     st.json(res)
 
 # Gains & Dividends
@@ -111,6 +115,29 @@ with tab:
     store = SQLiteStore(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3"))
     st.write("Transactions loaded:", len(txs))
     st.write("Holdings:", 0 if holdings is None else len(holdings))
+    st.subheader("Opening Positions")
+    from ledger.opening import infer_minimum_opening
+    inferred = infer_minimum_opening(txs)
+    if inferred:
+        st.warning("Missing opening holdings detected for some stocks.")
+        st.dataframe(pd.DataFrame([{"Stock": k, "Minimum Opening Qty": v, "Status": "Provisional"} for k, v in inferred.items()]), hide_index=True, width="stretch")
+        if st.button("Infer opening positions (provisional)"):
+            for isin, qty in inferred.items():
+                store.add_opening_position(isin, "2018-01-01", qty, source="inferred", verification_status="inferred")
+            st.success("Inferred opening positions added (provisional).")
+            st.rerun()
+    # manual entry
+    with st.form("opening_form"):
+        isin_in = st.text_input("ISIN")
+        qty_in = st.number_input("Opening Qty", min_value=0.0)
+        date_in = st.date_input("Ledger Opening Date")
+        if st.form_submit_button("Add Opening Position"):
+            store.add_opening_position(isin_in, str(date_in), qty_in, source="manual", verification_status="verified")
+            st.success("Opening position added.")
+            st.rerun()
+    ops = store.get_opening_positions()
+    if ops:
+        st.dataframe(pd.DataFrame(ops), hide_index=True, width="stretch")
     from src.pdf_parser import detect_duplicate_details, detect_missing_quarters
     missing = detect_missing_quarters(txs)
     if missing:

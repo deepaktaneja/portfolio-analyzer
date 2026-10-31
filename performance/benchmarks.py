@@ -110,7 +110,7 @@ def _periods(start, end, frequency):
     return out
 
 
-def calculate_annual_returns(transactions, actions=None, dividends=None, price_lookup=None, index_lookup_50=None, index_lookup_500=None, start_date=None, end_date=None, frequency="calendar"):
+def calculate_annual_returns(transactions, actions=None, dividends=None, price_lookup=None, index_lookup_50=None, index_lookup_500=None, start_date=None, end_date=None, frequency="calendar", opening_positions=None):
     from datetime import date as _date
     s = _to_date(start_date) if start_date else None
     e = _to_date(end_date) if end_date else None
@@ -123,8 +123,8 @@ def calculate_annual_returns(transactions, actions=None, dividends=None, price_l
     periods = _periods(s, e, frequency)
     out = []
     for label, ps, pe, partial in periods:
-        twr = calculate_portfolio_twr(transactions, actions, dividends, price_lookup, ps, pe)
-        px = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, ps, pe)
+        twr = calculate_portfolio_twr(transactions, actions, dividends, price_lookup, ps, pe, opening_positions=opening_positions)
+        px = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, ps, pe, opening_positions=opening_positions)
         def tri_ret(lookup, _ps=ps, _pe=pe):
             if lookup is None:
                 return None
@@ -168,9 +168,9 @@ def calculate_annual_returns(transactions, actions=None, dividends=None, price_l
     return out
 
 
-def compare_portfolio_benchmarks(transactions, actions=None, dividends=None, price_lookup=None, index_lookup_50=None, index_lookup_500=None, start_date=None, end_date=None):
-    tw = calculate_portfolio_twr(transactions, actions, dividends, price_lookup, start_date, end_date)
-    px = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, start_date, end_date)
+def compare_portfolio_benchmarks(transactions, actions=None, dividends=None, price_lookup=None, index_lookup_50=None, index_lookup_500=None, start_date=None, end_date=None, opening_positions=None):
+    tw = calculate_portfolio_twr(transactions, actions, dividends, price_lookup, start_date, end_date, opening_positions=opening_positions)
+    px = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, start_date, end_date, opening_positions=opening_positions)
     def tri(lookup, d):
         if lookup is None:
             return None

@@ -116,15 +116,15 @@ def _rights_flows(actions, security_id, start, end):
     return out
 
 
-def _holdings_qty(transactions, security_id, as_of):
+def _holdings_qty(transactions, security_id, as_of, opening_positions=None):
     from ledger.positions import get_stock_quantity
     try:
-        return get_stock_quantity(transactions, security_id, as_of, date_basis="trade")
+        return get_stock_quantity(transactions, security_id, as_of, date_basis="trade", opening_positions=opening_positions)
     except Exception:  # noqa: BLE001
         return 0.0
 
 
-def calculate_stock_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None):
+def calculate_stock_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None, opening_positions=None):
     sid = (security_id or "").strip().upper()
     trades = [t for t in (transactions or []) if _isin(t) == sid and _is_trade(t)]
     trades.sort(key=lambda t: (_to_date(_trade_date(t)), str(t.get("trade_no") or t.get("order_no") or "")))
@@ -136,7 +136,7 @@ def calculate_stock_xirr(transactions, actions=None, dividends=None, price_looku
     flows = []
     if sd > first_date:
         from datetime import timedelta
-        oq = _holdings_qty(transactions, sid, sd - timedelta(days=1))
+        oq = _holdings_qty(transactions, sid, sd - timedelta(days=1), opening_positions)
         if oq and price_lookup is not None:
             try:
                 op = price_lookup(sid, sd)
@@ -159,7 +159,7 @@ def calculate_stock_xirr(transactions, actions=None, dividends=None, price_looku
             flows.append((dd, amt, "dividend"))
     for dd, amt in _rights_flows(actions, sid, sd, ed):
         flows.append((dd, amt, "rights_subscription"))
-    rq = _holdings_qty(transactions, sid, ed)
+    rq = _holdings_qty(transactions, sid, ed, opening_positions)
     if rq and price_lookup is not None:
         try:
             tp = price_lookup(sid, ed)
@@ -171,7 +171,7 @@ def calculate_stock_xirr(transactions, actions=None, dividends=None, price_looku
     return {"xirr": x, "cashflows": flows}
 
 
-def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None):
+def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None, opening_positions=None):
     txs = [t for t in (transactions or []) if _is_trade(t)]
     if not txs:
         return {"xirr": None, "cashflows": [], "reason": "no_trades"}
@@ -184,7 +184,7 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
         ov = 0.0
         ok = True
         for sid in secs:
-            q = _holdings_qty(transactions, sid, sd - __import__("datetime").timedelta(days=1))
+            q = _holdings_qty(transactions, sid, sd - __import__("datetime").timedelta(days=1), opening_positions)
             if q and price_lookup is not None:
                 try:
                     p = price_lookup(sid, sd)
@@ -216,7 +216,7 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
     tv = 0.0
     tok = True
     for sid in secs:
-        q = _holdings_qty(transactions, sid, ed)
+        q = _holdings_qty(transactions, sid, ed, opening_positions)
         if q and price_lookup is not None:
             try:
                 p = price_lookup(sid, ed)
@@ -232,7 +232,7 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
     return {"xirr": x, "cashflows": flows}
 
 
-def calculate_investment_cycle_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None):
+def calculate_investment_cycle_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, opening_positions=None):
     sid = (security_id or "").strip().upper()
     trades = [t for t in (transactions or []) if _isin(t) == sid and _is_trade(t)]
     trades.sort(key=lambda t: (_to_date(_trade_date(t)), str(t.get("trade_no") or t.get("order_no") or "")))
@@ -256,7 +256,7 @@ def calculate_investment_cycle_xirr(transactions, actions=None, dividends=None, 
     return cycles
 
 
-def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None):
+def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None, opening_positions=None):
     txs = [t for t in (transactions or []) if _is_trade(t)]
     if not txs:
         return None
@@ -274,7 +274,10 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
         v = 0.0
         for sid in secs:
             from ledger.positions import get_stock_quantity
-            q = get_stock_quantity(transactions, sid, d, date_basis="trade")
+            try:
+                q = get_stock_quantity(transactions, sid, d, date_basis="trade", opening_positions=opening_positions)
+            except ValueError:
+                q = 0.0
             if q and price_lookup is not None:
                 try:
                     p = price_lookup(sid, d)
@@ -306,13 +309,13 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
 
 
 
-def get_xirr_cashflow_audit(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None, scope="stock"):
+def get_xirr_cashflow_audit(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None, scope="stock", opening_positions=None):
     if scope == "portfolio":
-        res = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, start_date, end_date)
+        res = calculate_portfolio_xirr(transactions, actions, dividends, price_lookup, start_date, end_date, opening_positions=opening_positions)
     elif scope == "cycle":
-        res = calculate_investment_cycle_xirr(transactions, actions, dividends, price_lookup, security_id=security_id)
+        res = calculate_investment_cycle_xirr(transactions, actions, dividends, price_lookup, security_id=security_id, opening_positions=opening_positions)
     else:
-        res = calculate_stock_xirr(transactions, actions, dividends, price_lookup, security_id=security_id, start_date=start_date, end_date=end_date)
+        res = calculate_stock_xirr(transactions, actions, dividends, price_lookup, security_id=security_id, start_date=start_date, end_date=end_date, opening_positions=opening_positions)
     if isinstance(res, list):
         return [r.get("cashflows", []) for r in res]
     return res.get("cashflows", [])
