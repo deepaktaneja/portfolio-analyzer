@@ -16,13 +16,6 @@ from app.shared import (
 st.set_page_config(page_title="ICICI Portfolio Analyzer", layout="wide")
 st.title("ICICI Direct Portfolio Analyzer")
 
-# Global filters
-with st.sidebar:
-    st.header("Filters")
-    start_date = st.date_input("Start date", value=None)
-    end_date = st.date_input("End date", value=None)
-    stock_status = st.selectbox("Stocks", ["all", "current", "exited"], index=0)
-    div_mode = st.selectbox("Dividend view", ["gross", "net"], index=0)
 
 # Load data
 if "txs" not in st.session_state:
@@ -32,6 +25,17 @@ if "holdings" not in st.session_state:
 txs = st.session_state["txs"]
 holdings = st.session_state["holdings"]
 pl = price_lookup_factory()
+
+# Global filters
+with st.sidebar:
+    st.header("Filters")
+    _ds = sorted({(t.get("trade_date") or t.get("settlement_date")) for t in txs if (t.get("trade_date") or t.get("settlement_date"))})
+    _d0 = _ds[0] if _ds else None
+    _d1 = _ds[-1] if _ds else None
+    start_date = st.date_input("Start date", value=_d0)
+    end_date = st.date_input("End date", value=_d1)
+    stock_status = st.selectbox("Stocks", ["all", "current", "exited"], index=0)
+    div_mode = st.selectbox("Dividend view", ["gross", "net"], index=0)
 
 tabs = st.tabs(["Overview", "Stock Analysis", "Annual Performance", "Benchmark Analysis", "Gains & Dividends", "Data Management"])
 
@@ -48,6 +52,11 @@ with tab:
     st.metric("Current Portfolio Value", inr(total_val))
     st.metric("Transactions", len(txs))
     st.metric("Securities", len({t.get("isin") for t in txs if t.get("isin")}))
+    from market_data.repository import MarketDataStore
+    _md = MarketDataStore("data/market_data.sqlite3")
+    _mdr = _md.get_market_data_quality_report()
+    if not _mdr.get("securities"):
+        st.warning("No market data imported. TWR/unrealized values will be unavailable. Import prices in Data Management.")
     if holdings is not None:
         st.dataframe(holdings, hide_index=True, width="stretch")
 
@@ -72,19 +81,24 @@ with tab:
             qty = 0.0
             st.warning("Negative holdings detected for this stock; opening position may be missing.")
         st.metric("Current Quantity", qty)
-        res = calculate_stock_xirr(txs, security_id=sel, end_date="2025-01-01", price_lookup=pl)
-        st.metric("Stock XIRR", str(res.get("xirr")))
-        summary = get_stock_profit_summary(txs, security_id=sel, as_of_date="2025-01-01", price_lookup=pl)
+        res = calculate_stock_xirr(txs, security_id=sel, end_date=end_date, price_lookup=pl)
+        _x = res.get("xirr")
+        st.metric("Stock XIRR", f"{_x*100:.2f}%" if _x is not None else "N/A")
+        summary = get_stock_profit_summary(txs, security_id=sel, as_of_date=end_date, price_lookup=pl)
         st.json(summary)
 
 # Annual Performance
 tab = tabs[2]
 with tab:
     st.subheader("Annual Performance")
+    from market_data.repository import MarketDataStore
+    _mdr = MarketDataStore("data/market_data.sqlite3").get_market_data_quality_report()
+    if not _mdr.get("securities"):
+        st.warning("No market data imported; TWR/unrealized values unavailable.")
     from performance.benchmarks import calculate_annual_returns
     from src.store import SQLiteStore as _SS
     _o = _SS(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")).get_opening_positions()
-    rows = calculate_annual_returns(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", frequency="calendar", opening_positions=_o)
+    rows = calculate_annual_returns(txs, price_lookup=pl, start_date=start_date, end_date=end_date, frequency="calendar", opening_positions=_o)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 # Benchmark Analysis
@@ -94,7 +108,7 @@ with tab:
     from performance.benchmarks import compare_portfolio_benchmarks
     from src.store import SQLiteStore as _SS
     _o = _SS(os.environ.get("ICICI_XIRR_DB_PATH", "data/xirr.sqlite3")).get_opening_positions()
-    res = compare_portfolio_benchmarks(txs, price_lookup=pl, start_date="2024-01-01", end_date="2024-12-31", opening_positions=_o)
+    res = compare_portfolio_benchmarks(txs, price_lookup=pl, start_date=start_date, end_date=end_date, opening_positions=_o)
     st.json(res)
 
 # Gains & Dividends
@@ -102,8 +116,8 @@ tab = tabs[4]
 with tab:
     st.subheader("Gains & Dividends")
     from accounting.fifo import calculate_realized_gains, calculate_unrealized_gains
-    rg = calculate_realized_gains(txs, start_date="2024-01-01", end_date="2024-12-31")
-    ug = calculate_unrealized_gains(txs, as_of_date="2025-01-01", price_lookup=pl)
+    rg = calculate_realized_gains(txs, start_date=start_date, end_date=end_date)
+    ug = calculate_unrealized_gains(txs, as_of_date=end_date, price_lookup=pl)
     st.dataframe(pd.DataFrame(rg), hide_index=True, width="stretch")
     st.dataframe(pd.DataFrame(ug), hide_index=True, width="stretch")
 
@@ -154,22 +168,6 @@ with tab:
             st.dataframe(pd.DataFrame(mism), hide_index=True, width="stretch")
         else:
             st.success("Holdings reconcile.")
-
-    # Opening positions
-    st.subheader("Opening Positions")
-    from ledger.opening import infer_minimum_opening
-    inferred = infer_minimum_opening(txs)
-    if inferred:
-        st.warning("Missing opening holdings detected for some stocks.")
-        rows = []
-        for isin, qty in inferred.items():
-            rows.append({"Stock": isin, "Minimum Opening Qty": qty, "Status": "Provisional"})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    # negative holdings
-    from ledger.positions import check_negative_holdings
-    negs = check_negative_holdings(txs, "2099-12-31")
-    if negs:
-        st.warning("Negative holdings: " + ", ".join(negs[:10]))
 
     with st.form("opening_form"):
         isin_in = st.text_input("ISIN")
