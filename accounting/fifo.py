@@ -61,6 +61,11 @@ def _action_date(a):
 
 
 def _build_events(transactions, actions):
+    try:
+        from corporate_actions.engine import _dedupe_actions
+        actions = _dedupe_actions(actions)
+    except Exception:  # noqa: BLE001
+        pass
     events = []
     for t in transactions or []:
         if not _is_trade(t):

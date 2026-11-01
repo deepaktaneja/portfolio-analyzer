@@ -9,6 +9,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 DATABASE_URL = os.getenv("ICICI_XIRR_DB_PATH", "sqlite:///data/xirr.sqlite3")
+if not DATABASE_URL.startswith("sqlite"):
+    DATABASE_URL = f"sqlite:///{DATABASE_URL}"
 
 
 class Base(DeclarativeBase):

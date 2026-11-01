@@ -1,15 +1,7 @@
-"""Streamlit entry point for the Indian equity portfolio analyzer."""
-
+"""Streamlit entry point."""
 from __future__ import annotations
-
-import streamlit as st
-
-
-def main() -> None:
-    st.set_page_config(page_title="Indian Portfolio Analyzer", layout="wide")
-    st.title("Indian Equity Portfolio Analyzer")
-    st.caption("Stage 00: project scaffolding is initialized.")
-
-
-if __name__ == "__main__":
-    main()
+import os, runpy
+from pathlib import Path
+ROOT=Path(__file__).resolve().parent.parent
+os.chdir(ROOT)
+runpy.run_path(str(ROOT/"app.py"), run_name="__main__")

@@ -85,6 +85,71 @@ def import_stock_prices(path, exchange="NSE", source=None):
     return rows, warnings
 
 
+DIVIDEND_ALIASES = {
+    "date": {"date", "exdate", "ex_date", "ex-dividenddate", "exdividenddate"},
+    "payment_date": {"paymentdate", "payment_date", "creditdate", "credit_date"},
+    "record_date": {"recorddate", "record_date"},
+    "security_id": {"security", "securityid", "symbol", "ticker", "isin", "code"},
+    "amount": {"amount", "dividend", "dividendpershare", "dividend_per_share", "dps", "div"},
+    "currency": {"currency", "ccy"},
+}
+
+
+def import_dividend_events(path, source=None):
+    from datetime import datetime
+    df = _read_frame(path)
+    m = _detect_columns(df, DIVIDEND_ALIASES)
+    if "date" not in m or "security_id" not in m or "amount" not in m:
+        raise ValueError("missing required columns")
+    rows = []
+    warnings = []
+    for _, r in df.iterrows():
+        try:
+            d = str(r[m["date"]]).strip()
+            parsed = None
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y"):
+                try:
+                    parsed = datetime.strptime(d, fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                warnings.append(f"bad date: {d}")
+                continue
+            sid = str(r[m["security_id"]]).strip().upper()
+            amt = float(str(r[m["amount"]]).replace(",", ""))
+            pay = None
+            if "payment_date" in m and pd.notna(r[m["payment_date"]]):
+                pdv = str(r[m["payment_date"]]).strip()
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y"):
+                    try:
+                        pay = datetime.strptime(pdv, fmt).strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+            rec = None
+            if "record_date" in m and pd.notna(r[m["record_date"]]):
+                rdv = str(r[m["record_date"]]).strip()
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y"):
+                    try:
+                        rec = datetime.strptime(rdv, fmt).strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+            ccy = str(r[m["currency"]]).strip().upper() if "currency" in m and pd.notna(r[m["currency"]]) else "INR"
+            rows.append({
+                "security_id": sid,
+                "ex_date": parsed,
+                "record_date": rec,
+                "payment_date": pay or parsed,
+                "dividend_per_share": amt,
+                "currency": ccy,
+                "source": source or os.path.basename(path),
+            })
+        except Exception as e:  # noqa: BLE001
+            warnings.append(str(e))
+    return rows, warnings
+
 def import_index_tri(path, index_id, source=None):
     from datetime import datetime
     df = _read_frame(path)

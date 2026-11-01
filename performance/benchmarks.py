@@ -120,6 +120,33 @@ def calculate_annual_returns(transactions, actions=None, dividends=None, price_l
     if e is None:
         ds = [_to_date(t.get("trade_date") or t.get("settlement_date") or t.get("date")) for t in (transactions or [])]
         e = max(ds) if ds else _date.today()
+    # Cache benchmark TRI lookups in memory.
+    _orig50 = index_lookup_50
+    _orig500 = index_lookup_500
+    _cache50 = {}
+    _cache500 = {}
+    def _idx50_cached(d):
+        dd = _to_date(d)
+        if dd not in _cache50:
+            if _orig50 is None:
+                _cache50[dd] = None
+            elif callable(_orig50):
+                _cache50[dd] = _orig50(dd)
+            else:
+                _cache50[dd] = _orig50.get(dd)
+        return _cache50[dd]
+    def _idx500_cached(d):
+        dd = _to_date(d)
+        if dd not in _cache500:
+            if _orig500 is None:
+                _cache500[dd] = None
+            elif callable(_orig500):
+                _cache500[dd] = _orig500(dd)
+            else:
+                _cache500[dd] = _orig500.get(dd)
+        return _cache500[dd]
+    index_lookup_50 = _idx50_cached if _orig50 is not None else None
+    index_lookup_500 = _idx500_cached if _orig500 is not None else None
     periods = _periods(s, e, frequency)
     out = []
     for label, ps, pe, partial in periods:

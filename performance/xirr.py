@@ -1,8 +1,10 @@
 """Performance and XIRR engine (Stage 07)."""
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime
 
+from ledger.positions import reconstruct
 from src.xirr import compute_xirr
 
 TOL = 1e-9
@@ -116,12 +118,43 @@ def _rights_flows(actions, security_id, start, end):
     return out
 
 
+def _holdings_as_of(transactions, as_of, opening_positions=None):
+    cutoff = _to_date(as_of)
+    quantities = defaultdict(float)
+    for op in (opening_positions or []):
+        try:
+            od = _to_date(op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date)
+        except Exception:  # noqa: BLE001
+            continue
+        if od is not None and od <= cutoff:
+            isin = op.get("security_id") if isinstance(op, dict) else op.security_id
+            isin = str(isin or "").strip().upper()
+            if not isin:
+                continue
+            qty = op.get("opening_qty") if isinstance(op, dict) else op.opening_qty
+            try:
+                quantities[isin] += float(qty or 0.0)
+            except (TypeError, ValueError):
+                pass
+    for t in (transactions or []):
+        if not _is_trade(t):
+            continue
+        dd = _to_date(_trade_date(t))
+        if dd <= cutoff:
+            isin = _isin(t)
+            if not isin:
+                continue
+            side = _side(t)
+            q = _qty(t)
+            if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+                quantities[isin] += q
+            elif side == "SELL":
+                quantities[isin] -= q
+    return quantities
+
+
 def _holdings_qty(transactions, security_id, as_of, opening_positions=None):
-    from ledger.positions import get_stock_quantity
-    try:
-        return get_stock_quantity(transactions, security_id, as_of, date_basis="trade", opening_positions=opening_positions)
-    except Exception:  # noqa: BLE001
-        return 0.0
+    return float(_holdings_as_of(transactions, as_of, opening_positions).get(str(security_id).strip().upper(), 0.0))
 
 
 def calculate_stock_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None, opening_positions=None):
@@ -183,15 +216,16 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
     if sd > first:
         ov = 0.0
         ok = True
+        holdings_before = _holdings_as_of(transactions, sd - __import__("datetime").timedelta(days=1), opening_positions)
         for sid in secs:
-            q = _holdings_qty(transactions, sid, sd - __import__("datetime").timedelta(days=1), opening_positions)
+            q = holdings_before.get(sid, 0.0)
             if q and price_lookup is not None:
                 try:
                     p = price_lookup(sid, sd)
                 except Exception:  # noqa: BLE001
                     p = None
                 if p is not None:
-                    ov += q * float(p)
+                    ov += float(q) * float(p)
                 else:
                     ok = False
         if ok and ov:
@@ -215,21 +249,31 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
             flows.append((dd, amt, "rights_subscription"))
     tv = 0.0
     tok = True
+    holdings_ed = _holdings_as_of(transactions, ed, opening_positions)
     for sid in secs:
-        q = _holdings_qty(transactions, sid, ed, opening_positions)
+        q = holdings_ed.get(sid, 0.0)
         if q and price_lookup is not None:
             try:
                 p = price_lookup(sid, ed)
             except Exception:  # noqa: BLE001
                 p = None
             if p is not None:
-                tv += q * float(p)
+                tv += float(q) * float(p)
             else:
                 tok = False
     if tok and tv:
         flows.append((ed, tv, "terminal_value"))
+    _amounts = [a for _, a, _ in flows]
+    if not (_amounts and min(_amounts) < 0 < max(_amounts)):
+        _reason = "invalid_cashflows"
+    elif not tok:
+        _reason = "missing_terminal_price"
+    else:
+        _reason = None
     x = compute_xirr([(d, a) for d, a, _ in flows])
-    return {"xirr": x, "cashflows": flows}
+    if x is None and _reason is None:
+        _reason = "solver_failed"
+    return {"xirr": x, "cashflows": flows, "reason": _reason}
 
 
 def calculate_investment_cycle_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, opening_positions=None):
@@ -268,23 +312,90 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
         dd = _to_date(_trade_date(t))
         if sd <= dd <= ed:
             dates.add(dd)
+    from collections import defaultdict
     dates = sorted(dates)
-    secs = sorted({_isin(t) for t in txs})
+    # Precompute holdings per valuation date in a single pass.
+    sd = dates[0] if dates else None
+    ed = dates[-1] if dates else None
+    quantities = defaultdict(float)
+    # apply transactions/openings before sd
+    if sd is not None:
+        for t in txs:
+            dd = _to_date(_trade_date(t))
+            if dd < sd:
+                isin = _isin(t)
+                if not isin:
+                    continue
+                side = _side(t)
+                q = _qty(t)
+                if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+                    quantities[isin] += q
+                elif side == "SELL":
+                    quantities[isin] -= q
+        for op in (opening_positions or []):
+            try:
+                od = _to_date(op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date)
+            except Exception:  # noqa: BLE001
+                continue
+            if od is not None and od < sd:
+                isin = op.get("security_id") if isinstance(op, dict) else op.security_id
+                isin = str(isin or "").strip().upper()
+                if not isin:
+                    continue
+                qty = op.get("opening_qty") if isinstance(op, dict) else op.opening_qty
+                try:
+                    quantities[isin] += float(qty or 0.0)
+                except (TypeError, ValueError):
+                    pass
+    # group events by date within [sd, ed]
+    events = defaultdict(lambda: {"trades": [], "openings": []})
+    for t in txs:
+        dd = _to_date(_trade_date(t))
+        if sd is not None and ed is not None and sd <= dd <= ed:
+            events[dd]["trades"].append(t)
+    for op in (opening_positions or []):
+        try:
+            od = _to_date(op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date)
+        except Exception:  # noqa: BLE001
+            continue
+        if od is not None and sd is not None and ed is not None and sd <= od <= ed:
+            events[od]["openings"].append(op)
+    holdings_by_date = {}
+    for d in dates:
+        for op in events[d]["openings"]:
+            isin = op.get("security_id") if isinstance(op, dict) else op.security_id
+            isin = str(isin or "").strip().upper()
+            if not isin:
+                continue
+            qty = op.get("opening_qty") if isinstance(op, dict) else op.opening_qty
+            try:
+                quantities[isin] += float(qty or 0.0)
+            except (TypeError, ValueError):
+                pass
+        for t in events[d]["trades"]:
+            isin = _isin(t)
+            if not isin:
+                continue
+            side = _side(t)
+            q = _qty(t)
+            if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+                quantities[isin] += q
+            elif side == "SELL":
+                quantities[isin] -= q
+        if any(q < -TOL for q in quantities.values()):
+            holdings_by_date[d] = {}
+        else:
+            holdings_by_date[d] = {k: v for k, v in quantities.items()}
     def port_value(d):
         v = 0.0
-        for sid in secs:
-            from ledger.positions import get_stock_quantity
-            try:
-                q = get_stock_quantity(transactions, sid, d, date_basis="trade", opening_positions=opening_positions)
-            except ValueError:
-                q = 0.0
+        for sid, q in holdings_by_date.get(d, {}).items():
             if q and price_lookup is not None:
                 try:
                     p = price_lookup(sid, d)
                 except Exception:  # noqa: BLE001
                     p = None
                 if p is not None:
-                    v += q * float(p)
+                    v += float(q) * float(p)
         return v
     cf_by_date = {d: 0.0 for d in dates}
     for t in txs:
@@ -298,6 +409,7 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
         elif side == "SELL":
             cf_by_date[dd] -= amt
     twr = 1.0
+    _has_valid = False
     for i in range(len(dates) - 1):
         v0 = port_value(dates[i])
         v1 = port_value(dates[i+1])
@@ -305,7 +417,8 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
         if v0 and v0 > 0:
             r = (v1 - cf - v0) / v0
             twr *= (1.0 + r)
-    return twr - 1.0 if len(dates) > 1 else None
+            _has_valid = True
+    return (twr - 1.0) if (_has_valid and len(dates) > 1) else None
 
 
 

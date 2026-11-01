@@ -6,6 +6,29 @@ from datetime import date
 from corporate_actions.models import CorporateAction
 
 TOL = 1e-9
+def _dedupe_actions(actions):
+    seen = set()
+    out = []
+    for a in actions or []:
+        key = getattr(a, "event_id", None)
+        if not key:
+            key = (getattr(a, "security_id", None), getattr(a, "event_type", None), str(getattr(a, "ex_date", None) or getattr(a, "effective_date", None) or getattr(a, "record_date", None)), getattr(a, "ratio", None), getattr(a, "successor_id", None))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+    seen = set()
+    out = []
+    for a in actions or []:
+        key = getattr(a, "event_id", None)
+        if not key:
+            key = (getattr(a, "security_id", None), getattr(a, "event_type", None), str(getattr(a, "ex_date", None) or getattr(a, "effective_date", None) or getattr(a, "record_date", None)), getattr(a, "ratio", None), getattr(a, "successor_id", None))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
 
 
 def _to_date(v):
@@ -172,27 +195,32 @@ def _apply_action(lots, action: CorporateAction, review: list):
     return lots
 
 
-def reconstruct_with_actions(transactions, actions, as_of_date):
+def reconstruct_with_actions(transactions, actions, as_of_date, apply_unverified_mergers=True):
     cutoff = _to_date(as_of_date) if not isinstance(as_of_date, date) else as_of_date
     lots = _build_lots(transactions)
     review = []
-    acts = [a for a in (actions or []) if _to_date(a.effective_date or a.record_date or a.ex_date) <= cutoff]
+    acts = [a for a in _dedupe_actions(actions) if _to_date(a.effective_date or a.record_date or a.ex_date) <= cutoff]
     acts.sort(key=lambda a: _to_date(a.effective_date or a.record_date or a.ex_date))
     for a in acts:
+        if a.event_type.lower() in ("merger", "demerger") and not a.verified and not apply_unverified_mergers:
+            review.append(f"{a.event_type} on {a.security_id} skipped (unverified)")
+            continue
         _apply_action(lots, a, review)
-    # quantities
     qty = {}
     for lot in lots:
         qty[lot["isin"]] = qty.get(lot["isin"], 0.0) + lot["qty"]
     return {k: v for k, v in qty.items() if abs(v) > TOL}, review
 
-def reconstruct_lots_with_actions(transactions, actions, as_of_date):
+def reconstruct_lots_with_actions(transactions, actions, as_of_date, apply_unverified_mergers=True):
     cutoff = _to_date(as_of_date) if not isinstance(as_of_date, date) else as_of_date
     lots = _build_lots(transactions)
     review = []
-    acts = [a for a in (actions or []) if _to_date(a.effective_date or a.record_date or a.ex_date) <= cutoff]
+    acts = [a for a in _dedupe_actions(actions) if _to_date(a.effective_date or a.record_date or a.ex_date) <= cutoff]
     acts.sort(key=lambda a: _to_date(a.effective_date or a.record_date or a.ex_date))
     for a in acts:
+        if a.event_type.lower() in ("merger", "demerger") and not a.verified and not apply_unverified_mergers:
+            review.append(f"{a.event_type} on {a.security_id} skipped (unverified)")
+            continue
         _apply_action(lots, a, review)
     return [l for l in lots if l["qty"] > TOL], review
 

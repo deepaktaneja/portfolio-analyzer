@@ -20,8 +20,10 @@ class CorporateAction:
     subscribed_quantity: float = 0.0
     sold_entitlement_quantity: float = 0.0
     expired: bool = False
+    event_id: str | None = None
     verified: bool = False
     source: str = "manual"
+    verification_status: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def credit_date(self) -> date:
