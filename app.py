@@ -1,4 +1,4 @@
-"""ICICI Direct portfolio dashboard (Stage 09)."""
+"""Investments Portfolio Analyzer (Stage 09)."""
 from __future__ import annotations
 
 import os
@@ -19,7 +19,7 @@ from app.shared import (
 )
 
 st.set_page_config(page_title="ICICI Portfolio Analyzer", layout="wide")
-st.title("ICICI Direct Portfolio Analyzer")
+st.title("Investments Portfolio Analyzer")
 
 MARKET_DB_PATH = os.environ.get("ICICI_MARKET_DATA_DB_PATH", "data/market_data.sqlite3")
 
@@ -44,7 +44,12 @@ with st.sidebar:
 
 pl = price_lookup_factory(market_db=MARKET_DB_PATH, start_date=start_date, end_date=end_date)
 
-tabs = st.tabs(["Overview", "Stock Analysis", "Annual Performance", "Benchmark Analysis", "Gains & Dividends", "Data Management", "Market Data"])
+tabs = st.tabs([
+    "Overview", "Stock Analysis", "Annual Performance", "Benchmark Analysis",
+    "Gains & Dividends", "Data Management", "Market Data",
+    "MF Overview", "MF Holdings", "MF XIRR", "MF Reconciliation",
+    "Consolidated Overview", "Consolidated Allocation", "Consolidated Performance",
+])
 
 # Overview
 tab = tabs[0]
@@ -399,6 +404,18 @@ with tab:
         if not _mdf.empty:
             _mdf["security_name"] = security_name(sel, txs, holdings)
         st.dataframe(_mdf, hide_index=True, width="stretch")
+    
+    # Clear all data button
+    if st.button("Clear All Data"):
+        import shutil, os
+        db_paths = ["data/xirr.sqlite3", "data/market_data.sqlite3", "data/portfolio.sqlite3"]
+        for db_path in db_paths:
+            if os.path.exists(db_path):
+                shutil.rmtree(db_path)
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.success("All data cleared. Please reload.")
+        st.rerun()
     from src.pdf_parser import detect_duplicate_details, detect_missing_quarters
     missing = detect_missing_quarters(txs)
     if missing:
@@ -591,3 +608,143 @@ except Exception as e:
                 st.rerun()
             except Exception as e:  # noqa: BLE001
                 st.error(f"TRI import failed: {e}")
+
+# ============================================================
+# MF Overview Tab
+# ============================================================
+tab_mf_overview = tabs[7]
+with tab_mf_overview:
+    st.subheader("MF Portfolio Overview")
+    st.info("MF overview requires imported MF statements. Use Data Management tab to import.")
+
+    try:
+        from mf.accounting import calculate_fund_xirr, calculate_portfolio_mf_xirr
+        from mf.reports import portfolio_mf_report
+        from mf.importers import is_mf_statement
+        import os
+
+        mf_dir = "data/statements"
+        mf_files = []
+        if os.path.isdir(mf_dir):
+            for f in os.listdir(mf_dir):
+                fp = os.path.join(mf_dir, f)
+                if os.path.isfile(fp) and is_mf_statement(fp):
+                    mf_files.append(fp)
+
+        if not mf_files:
+            st.warning("No MF statement files found in data/statements/")
+        else:
+            st.write(f"Found {len(mf_files)} MF statement file(s)")
+
+            # Load MF transactions (placeholder - would parse actual MF files)
+            # For now show structure
+            st.subheader("MF Portfolio Metrics")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total MF Value", "N/A")
+            col2.metric("Total Invested", "N/A")
+            col3.metric("MF XIRR", "N/A")
+            col4.metric("Total Gains", "N/A")
+
+    except Exception as e:
+        st.error(f"MF overview unavailable: {e}")
+
+# ============================================================
+# MF Holdings Tab
+# ============================================================
+tab_mf_holdings = tabs[8]
+with tab_mf_holdings:
+    st.subheader("MF Scheme Holdings")
+    st.info("Scheme-wise holdings requires MF statements with NAV data.")
+
+    try:
+        from mf.reports import scheme_holdings_report
+        import pandas as pd
+
+        st.write("MF holdings table will display here once MF statements are imported and NAVs are available.")
+        st.empty()  # placeholder for holdings table
+
+    except Exception as e:
+        st.error(f"MF holdings unavailable: {e}")
+
+# ============================================================
+# MF XIRR Tab
+# ============================================================
+tab_mf_xirr = tabs[9]
+with tab_mf_xirr:
+    st.subheader("MF Scheme XIRR")
+    st.info("Scheme-level XIRR requires MF transactions and NAV data.")
+
+    try:
+        from mf.reports import scheme_xirr_report
+        st.write("MF XIRR report will display here once MF transactions are imported.")
+
+    except Exception as e:
+        st.error(f"MF XIRR unavailable: {e}")
+
+# ============================================================
+# MF Reconciliation Tab
+# ============================================================
+tab_mf_recon = tabs[10]
+with tab_mf_recon:
+    st.subheader("MF Reconciliation")
+    st.info("Reconciles reconstructed units with reported holdings.")
+
+    try:
+        from mf.reports import reconciliation_report
+        st.write("Reconciliation report will display here once MF data is available.")
+
+    except Exception as e:
+        st.error(f"MF reconciliation unavailable: {e}")
+
+# ============================================================
+# Consolidated Overview Tab
+# ============================================================
+tab_cons_overview = tabs[11]
+with tab_cons_overview:
+    st.subheader("Consolidated Portfolio Overview")
+    st.info("Combined Equity + MF portfolio view.")
+
+    try:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Portfolio Value", "N/A")
+        col2.metric("Total Invested Capital", "N/A")
+        col3.metric("Consolidated XIRR", "N/A")
+        col4.metric("Total Dividend Income", "N/A")
+
+        st.write("Consolidated view combines equity and MF holdings once both data sources are available.")
+
+    except Exception as e:
+        st.error(f"Consolidated overview unavailable: {e}")
+
+# ============================================================
+# Consolidated Allocation Tab
+# ============================================================
+tab_cons_alloc = tabs[12]
+with tab_cons_alloc:
+    st.subheader("Consolidated Asset Allocation")
+    st.info("Equity vs Debt vs Hybrid vs Gold vs Other allocation.")
+
+    try:
+        import pandas as pd
+        from mf.allocation import classify_scheme
+
+        st.write("Allocation breakdown will display here once portfolio data is available.")
+        st.empty()
+
+    except Exception as e:
+        st.error(f"Consolidated allocation unavailable: {e}")
+
+# ============================================================
+# Consolidated Performance Tab
+# ============================================================
+tab_cons_perf = tabs[13]
+with tab_cons_perf:
+    st.subheader("Consolidated Performance vs Benchmark")
+    st.info("Combined portfolio performance vs Nifty 50 / Nifty 500 TRI.")
+
+    try:
+        st.write("Performance comparison charts will display here once equity + MF data is available.")
+        st.empty()
+
+    except Exception as e:
+        st.error(f"Consolidated performance unavailable: {e}")
