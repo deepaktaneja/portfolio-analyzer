@@ -10,5 +10,6 @@ reports/*
 *.db
 *.sqlite
 *.sqlite3
-.DS_Storelogs/
+.DS_Store
+logs/
 *.bak
