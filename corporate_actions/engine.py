@@ -12,18 +12,10 @@ def _dedupe_actions(actions):
     for a in actions or []:
         key = getattr(a, "event_id", None)
         if not key:
-            key = (getattr(a, "security_id", None), getattr(a, "event_type", None), str(getattr(a, "ex_date", None) or getattr(a, "effective_date", None) or getattr(a, "record_date", None)), getattr(a, "ratio", None), getattr(a, "successor_id", None))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(a)
-    return out
-    seen = set()
-    out = []
-    for a in actions or []:
-        key = getattr(a, "event_id", None)
-        if not key:
-            key = (getattr(a, "security_id", None), getattr(a, "event_type", None), str(getattr(a, "ex_date", None) or getattr(a, "effective_date", None) or getattr(a, "record_date", None)), getattr(a, "ratio", None), getattr(a, "successor_id", None))
+            key = (getattr(a, "security_id", None), getattr(a, "event_type", None),
+                   str(getattr(a, "ex_date", None) or getattr(a, "effective_date", None)
+                       or getattr(a, "record_date", None)),
+                   getattr(a, "ratio", None), getattr(a, "successor_id", None))
         if key in seen:
             continue
         seen.add(key)

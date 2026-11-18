@@ -79,7 +79,13 @@ def _to_float(value: Any) -> float | None:
 
 def _is_header(row: list) -> bool:
     joined = " ".join(str(c or "") for c in row).lower()
-    return "isin" in joined and ("buy" in joined or "sell" in joined or "quantity" in joined)
+    if "isin" in joined and ("buy" in joined or "sell" in joined or "quantity" in joined):
+        return True
+    # TRX-Equity statements omit the ISIN column; detect their header by the
+    # presence of the Security + Quantity + Buy/Sell column labels together.
+    if "security" in joined and "quantity" in joined and ("buy" in joined or "sell" in joined):
+        return True
+    return False
 _COLUMN_MAPS: dict = {}
 
 
@@ -122,24 +128,39 @@ class IciciEquityTransactionPdfParser:
                         "trade_no": _find_col(header, TRADE_NO_ALIASES),
                     }
                     colmap = {k: v for k, v in colmap.items() if v is not None}
+                    # Transaction tables must expose side, quantity and an identifier
+                    # (security name or ISIN). This skips summary/non-transaction
+                    # tables (e.g. the charge summary sheet).
+                    if (
+                        colmap.get("buy_sell") is None
+                        or colmap.get("quantity") is None
+                        or (colmap.get("security") is None and colmap.get("isin") is None)
+                    ):
+                        continue
                     _COLUMN_MAPS[(doc.name, pi, ti)] = colmap
+                    sec_idx = colmap.get("security")
+                    isin_idx = colmap.get("isin")
                     for ri, r in enumerate(table):
                         if r is None or all((c is None or str(c).strip() == "") for c in r):
                             continue
                         if _is_header(r):
                             continue
                         joined = " ".join(str(c or "") for c in r).lower()
-                        isin_idx = colmap.get("isin")
+                        isin_val = ""
                         if isin_idx is not None and isin_idx < len(r):
                             isin_val = str(r[isin_idx] or "").strip().upper()
-                            if not isin_val or not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin_val):
-                                continue
-                        if "total" in joined and (isin_idx is None or not str(r[isin_idx] or "").strip()):
+                            if isin_val and not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin_val):
+                                isin_val = ""
+                        sec_val = ""
+                        if sec_idx is not None and sec_idx < len(r):
+                            sec_val = str(r[sec_idx] or "").strip()
+                        # Keep a row only when it carries an identifier (ISIN or security name).
+                        if not isin_val and not sec_val:
+                            continue
+                        if "summary" in joined and not sec_val:
                             continue
                         rows.append(
                             RawRow(source_file=doc.name, page_number=pi, table_index=ti, row_index=ri, cells=list(r))
-
-
                         )
         return rows
     def normalize(self, raw) -> list:
@@ -148,18 +169,20 @@ class IciciEquityTransactionPdfParser:
         colmap = _COLUMN_MAPS.get((raw.source_file, raw.page_number, raw.table_index))
         if not colmap:
             return []
-        isin_i = colmap.get("isin")
-        if isin_i is None or isin_i >= len(cells):
-            return []
-        isin = str(cells[isin_i] or "").strip().upper()
-        if not isin or not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin):
-            return []
-
         def get(key):
             i = colmap.get(key)
             if i is None or i >= len(cells):
                 return None
             return cells[i]
+
+        # Some ICICI "TRX-Equity" statements carry only the security name (no ISIN
+        # column). Accept those rows and key them by security name downstream.
+        isin_i = colmap.get("isin")
+        isin_raw = str(cells[isin_i] or "").strip().upper() if isin_i is not None and isin_i < len(cells) else ""
+        isin = isin_raw if re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin_raw) else None
+        security_name = str(get("security") or "").strip().replace("\n", " ") or None
+        if not isin and not security_name:
+            return []
 
         bs_raw = str(get("buy_sell") or "").strip().upper()
         if bs_raw in ("B", "BUY", "B/S"):

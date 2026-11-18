@@ -1,0 +1,36 @@
+# Stage 12 — AI Investment Copilot configuration (user-editable).
+# The copilot is tool-first: all figures come from deterministic engines.
+# The LLM only routes intent and phrases explanations; it never computes figures.
+
+llm:
+  enabled: true          # when false, deterministic answers are still produced
+  temperature: 0.1
+  max_tokens: 1200
+  narrate: true          # LLM phrasing around tool-provided facts
+  intent_fallback: true  # LLM structured intent parsing when keyword rules are unsure
+
+history:
+  max_turns: 20
+  persist: false         # session-only by default (privacy)
+
+security:
+  max_input_chars: 2000
+  rate_limit_per_minute: 30
+  audit: true
+
+tools:
+  enabled:
+    - portfolio_summary
+    - holdings
+    - xirr
+    - allocation
+    - concentration
+    - gains
+    - dividends
+    - rebalance_plan
+    - trim_simulation
+    - overlap
+    - replacement_simulation
+    - signals
+    - explain_signal
+    - research_report

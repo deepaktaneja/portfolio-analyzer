@@ -48,6 +48,7 @@ portfolio_intelligence/
 ├── mcp/              # registry, adapter, evidence cache, client (connects to external MCP servers)
 ├── research/         # LLM workflow, research-report generation, prompts, evidence citation
 ├── decision/         # risk signals (concentration, valuation, appreciation, earnings, governance), HOLD/MONITOR/TRIM/EXIT
+├── portfolio/         # Stage 9: allocation drift, tax-aware rebalancing, tax lots, scenario comparison
 ├── ui/               # Streamlit pages
 └── tests/            # unit/integration/property/golden tests
 ```
@@ -65,7 +66,12 @@ portfolio_intelligence/
 - **`mcp`**: MCP client manager (trusted registry, stdio + streamable_http), adapter that validates discovered tools before calling, evidence-envelope builder, `mcp_cache` read/write, graceful degradation/circuit breaker when a server is unreachable.
 - **`research`**: LLM orchestrator (Gemini primary, OpenRouter fallback), prompt templates, research-report generation, evidence-envelope citation, report storage.
 - **`decision`**: risk detectors (concentration, excessive valuation, rapid appreciation, earnings deterioration, governance), explainable HOLD/MONITOR/TRIM/EXIT signal generation with reasons and severity.
-- **`ui`**: Streamlit pages for import, holdings, XIRR/performance, research reports, decision signals, MF overlap/allocation, rebalancing simulation, admin (corporate-action verification, MCP cache).
+- **`portfolio`**: allocation analysis (asset class, sector, market-cap, direct-vs-MF) vs configurable targets; date-effective Indian tax rules (STCG/LTCG, exemption, STT, exit load); FIFO tax-lot reconstruction with missing-cost-basis flagging; deterministic cash-first, signal-aware, compounder-protecting rebalancing planner; annual/threshold/on-demand strategies; current-vs-proposed scenario comparison. Advisory only — no trades executed.
+- **`scheduler`**: lightweight SQLite-backed scheduler (no external queue) with idempotent per-period job keys, crash recovery, and jobs for price/NAV refresh, corporate actions, research, alert evaluation and encrypted backups. CLI: `python -m scheduler`.
+- **`alerts`**: deduplicated, configurable advisory alerts derived from Stage 8 signals, allocation breaches and data-health (stale/failed/reconciliation); in-app delivery with email/webhook stubs (logging only — never sent).
+- **`security`**: Fernet-based encryption (PBKDF2 key derivation), secret/PII redaction for logs, and encrypted, sha256-verified SQLite backups with tested restore.
+- **`monitoring`**: dependency-free metrics aggregation (scheduler, alerts, LLM usage, MCP cache, DB sizes) with Prometheus text export.
+- **`ui`**: Streamlit pages for import, holdings, XIRR/performance, research reports, decision signals, MF overlap/allocation, rebalancing simulation, alerts, automation/monitoring and admin (corporate-action verification, MCP cache).
 - **`tests`**: unit tests per module, integration tests across import→accounting→performance, golden fixtures for deterministic outputs, property tests for XIRR/convergence.
 
 
@@ -104,4 +110,38 @@ ui ─────► research/decision/mf/backtesting/performance/accounting/im
 - No microservices, message queues, Kubernetes, or multi-agent orchestration frameworks.
 - No autonomous trading or order execution.
 - No real-time pricing hard dependency — `nse-market` MCP is disabled in the existing registry; treated as a gap with fallback (see `mcp_integration.md` and `open_questions.md`).
+
+## 8. Stage 10 — automation, reliability & production readiness
+
+- **Process model**: the Streamlit app remains single-process; a *separate* scheduler process
+  (`python -m scheduler --loop …`) runs refresh/backup/alert jobs. In Docker, `docker-compose.yml`
+  runs them as two services sharing bind-mounted `data/`, `config/`, `logs/`.
+- **Idempotency & recovery**: every job run is tracked in `data/scheduler.sqlite3` with a unique
+  `(job_name, idempotency_key)`; keys are scoped (hourly/daily/weekly/monthly/quarterly). Interrupted
+  runs are marked failed and retried; completed periods are never reprocessed.
+- **Failure isolation**: refresh jobs never raise into the ledger; a failed MCP/API call degrades to a
+  partial envelope or stale cache and leaves portfolio data untouched.
+- **Security boundary**: secrets stay in `.env`; logs pass through a redaction filter; LLM prompts
+  receive only sanitised external text; backups are Fernet-encrypted and verified before restore.
+- **No external side effects**: email/webhook notifications are logging stubs; no autonomous trading.
+
+## 9. Stage 12 — AI Investment Copilot
+
+- **Tool-first orchestration**: `copilot/engine.py` sanitises input → routes intent
+  (`copilot/intent.py`) → validates args (`copilot/security.py`) → executes an allowlisted
+  read-only tool (`copilot/tools/*`) that wraps an existing deterministic engine → builds a
+  cited, tiered answer (`copilot/response.py`).
+- **No LLM arithmetic**: tool outputs are the authoritative figures; the LLM only routes intent
+  (validated) and phrases explanations bounded to provided facts. The copilot is fully functional
+  without an LLM (deterministic answers; research reported unavailable rather than fabricated).
+- **Read-only & least privilege**: no tool mutates data or trades; all tools require `view`.
+  Prompt-injection sanitisation, argument schema validation, rate limiting and redacted auditing apply.
+- **Privacy**: conversation history is session-only (Streamlit `session_state`), capped and clearable;
+  free-text tool arguments are redacted in logs.
+- **UI**: an expander panel inside the existing five pages (no new top-level tabs). Context is built
+  only when a question is submitted; suggestions are static, keeping page render fast.
+- **Efficiency**: research is cached-first (fresh stored report avoids MCP/LLM calls); tools fetch only
+  the data a question needs; evidence uses the Stage-10 MCP cache/circuit-breaker/size guard.
+
+
 

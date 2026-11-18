@@ -1,0 +1,28 @@
+# Stage 10 — automated refresh schedule (user-editable).
+# interval_hours controls cadence; scope controls idempotency granularity
+# (hourly | daily | weekly | monthly | quarterly) so a job never double-processes
+# the same period even if the scheduler restarts or is triggered repeatedly.
+timezone: Asia/Kolkata
+stale_run_timeout_minutes: 30
+
+jobs:
+  refresh_prices:
+    enabled: true
+    interval_hours: 24
+    scope: daily
+  refresh_corporate_actions:
+    enabled: true
+    interval_hours: 24
+    scope: daily
+  refresh_research:
+    enabled: true
+    interval_hours: 720      # ~monthly; set 2160 for quarterly cadence
+    scope: monthly
+  evaluate_alerts:
+    enabled: true
+    interval_hours: 6
+    scope: hourly
+  backup_databases:
+    enabled: true
+    interval_hours: 24
+    scope: daily

@@ -1,0 +1,1 @@
+"""Configuration package for the portfolio intelligence application."""

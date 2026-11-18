@@ -1,0 +1,41 @@
+# Stage 10 — alert & notification preferences (user-editable).
+# Channels: in_app (always safe). email/webhook are STUBS that only log —
+# nothing external is sent without explicit approval.
+enabled: true
+default:
+  enabled: true
+  channels: [in_app]
+  cooldown_minutes: 360
+  frequency: immediate      # immediate | daily | weekly
+  min_severity: INFO        # INFO | WARN | CRITICAL
+
+types:
+  SIGNAL_EXIT:
+    cooldown_minutes: 60
+    min_severity: INFO
+  SIGNAL_TRIM:
+    cooldown_minutes: 120
+    min_severity: WARN
+  SIGNAL_MONITOR:
+    enabled: false          # reduce noise; Stage 8 MONITOR stays in-app only
+  CONCENTRATION:
+    cooldown_minutes: 720
+    min_severity: WARN
+  VALUATION:
+    cooldown_minutes: 720
+    min_severity: WARN
+  GOVERNANCE:
+    cooldown_minutes: 720
+    min_severity: INFO
+  EARNINGS:
+    cooldown_minutes: 720
+    min_severity: WARN
+  STALE_DATA:
+    cooldown_minutes: 360
+    min_severity: WARN
+  IMPORT_FAILURE:
+    cooldown_minutes: 360
+    min_severity: INFO
+  RECONCILIATION:
+    cooldown_minutes: 720
+    min_severity: WARN

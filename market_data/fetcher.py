@@ -246,27 +246,7 @@ def sync_index_tri(index_id, start=None, end=None, db_path=None, source_url=None
             with os.fdopen(fd, "wb") as f:
                 f.write(r.content)
         else:
-            import requests
-            session = requests.Session()
-            try:
-                session.get("https://www.niftyindices.com/reports/historical-data", timeout=10)
-            except Exception:
-                pass
-            payload = {"cinfo": "{'name':'%s','startDate':'%s','endDate':'%s','indexName':'%s'}" % (index_name, start, end, index_name)}
-            headers = {
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://www.niftyindices.com/reports/historical-data",
-                "User-Agent": "Mozilla/5.0",
-            }
-            r = session.post("https://www.niftyindices.com/Backpage.aspx/getTotalReturnIndexString", json=payload, headers=headers, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("d", data)
-            if isinstance(content, (dict, list)):
-                import json
-                content = json.dumps(content)
-            content = str(content)
+            content = _fetch_nifty_tri_content(index_name, start, end)
             suffix = ".html" if "<table" in content.lower() else ".csv"
             fd, tmp_path = tempfile.mkstemp(suffix=suffix)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -290,3 +270,214 @@ def sync_dividend_events(path, db_path=None, source=None):
     store = MarketDataStore(_default_db(db_path))
     n = store.upsert_dividend_events(parsed)
     return {"rows": len(parsed), "upserted": n, "warnings": warnings}
+
+
+def sync_index_tri_yfinance(index_id, start=None, end=None, db_path=None):
+    """Fallback loader: index price levels from Yahoo Finance (proxy for TRI).
+ 
+    NIFTY50TRI -> ^NSEI, NIFTY500TRI -> ^CRSLDX. These are price indices
+    (dividends excluded), stored with source yfinance_price_proxy.
+    """
+    from datetime import date as _date
+    from datetime import timedelta
+
+    import yfinance as yf
+
+    from market_data.repository import MarketDataStore
+
+    iid = str(index_id).strip().upper()
+    symbol = {"NIFTY50TRI": "^NSEI", "NIFTY500TRI": "^CRSLDX"}.get(iid)
+    if not symbol:
+        raise ValueError("No Yahoo symbol mapping for " + iid)
+    s = str(start)[:10] if start else "2000-01-01"
+    e = str(end)[:10] if end else None
+    if e:
+        try:
+            e = (_date.fromisoformat(e) + timedelta(days=1)).isoformat()
+        except ValueError:
+            pass
+    df = yf.download(symbol, start=s, end=e, progress=False, auto_adjust=False)
+    if df is None or len(df) == 0:
+        raise ValueError("No Yahoo data for " + symbol)
+    close = df["Close"]
+    if hasattr(close, "columns"):
+        close = close.iloc[:, 0]
+    rows = []
+    for idx, val in close.items():
+        try:
+            lvl = float(val)
+        except (TypeError, ValueError):
+            continue
+        if lvl != lvl:
+            continue
+        d = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+        rows.append({
+            "index_id": iid,
+            "trade_date": d,
+            "level": lvl,
+            "raw_value": lvl,
+            "source": "yfinance_price_proxy",
+            "provider": "yfinance",
+            "verification_status": "provisional",
+        })
+    n = MarketDataStore(db_path).upsert_index_tri(rows)
+    return {"benchmark": iid, "upserted": n, "source": "yfinance_price_proxy", "symbol": symbol}
+
+
+def _fetch_nifty_tri_content(index_name, start, end, retries=3, delay=1.5):
+    """Fetch the TRI table from niftyindices with retries and endpoint fallbacks."""
+    import json
+    import time
+
+    import requests
+
+    cinfo = (
+        "{name:" + index_name + ",startDate:" + start
+        + ",endDate:" + end + ",indexName:" + index_name + "}"
+    )
+    payload = {"cinfo": cinfo}
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.niftyindices.com/reports/historical-data",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    endpoints = (
+        "https://www.niftyindices.com/Backpage.aspx/getTotalReturnIndexString",
+        "https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString",
+    )
+    errors = []
+    for attempt in range(max(1, int(retries))):
+        for url in endpoints:
+            try:
+                session = requests.Session()
+                try:
+                    session.get("https://www.niftyindices.com/reports/historical-data", timeout=10)
+                except Exception:  # noqa: BLE001
+                    pass
+                r = session.post(url, json=payload, headers=headers, timeout=60)
+                r.raise_for_status()
+                try:
+                    data = r.json()
+                except ValueError:
+                    body = r.text
+                    if "<table" in body.lower() or "close" in body.lower():
+                        return body
+                    raise
+                content = data.get("d", data)
+                if isinstance(content, (dict, list)):
+                    content = json.dumps(content)
+                content = str(content)
+                if not content or content in ("null", "None"):
+                    raise ValueError("empty response")
+                return content
+            except Exception as e:  # noqa: BLE001
+                errors.append(url + ": " + str(e))
+        if delay:
+            time.sleep(float(delay) * (attempt + 1))
+    raise ValueError("Nifty TRI fetch failed after retries (" + "; ".join(errors[-2:]) + ")")
+
+
+def _parse_nse_index_close_csv(text, index_name):
+    """Parse a NSE ind_close_all CSV and return the closing value for an index."""
+    import csv
+    import io
+
+    target = str(index_name).strip().lower()
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        for row in reader:
+            name = str(row.get("Index Name") or row.get("Index") or "").strip().lower()
+            if name != target:
+                continue
+            for key in ("Closing Index Value", "Close", "Closing Value"):
+                if row.get(key):
+                    try:
+                        return float(str(row[key]).replace(",", "").strip())
+                    except ValueError:
+                        return None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _fetch_nse_index_close(date_str, index_name, timeout=15):
+    """Download one NSE daily index archive CSV and extract an index close."""
+    import requests
+
+    d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+    url = (
+        "https://archives.nseindia.com/content/indices/ind_close_all_"
+        + d.strftime("%d%m%Y") + ".csv"
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+        ),
+        "Accept": "text/csv,application/csv,*/*",
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    if r.status_code != 200 or not r.text:
+        return None
+    return _parse_nse_index_close_csv(r.text, index_name)
+
+
+def sync_index_tri_nse_archive(index_id, start=None, end=None, db_path=None, max_requests=250):
+    """Fill benchmark levels from NSE daily index archives (price index series)."""
+    from datetime import date as _date
+
+    from market_data.prices import get_missing_benchmark_dates
+    from market_data.repository import MarketDataStore
+
+    iid = str(index_id).strip().upper()
+    name = {"NIFTY50TRI": "Nifty 50", "NIFTY500TRI": "Nifty 500"}.get(iid)
+    if not name:
+        raise ValueError("No NSE archive mapping for " + iid)
+    s = str(start)[:10] if start else "2007-01-01"
+    e = str(end)[:10] if end else _date.today().isoformat()
+    db = _default_db(db_path)
+    missing = get_missing_benchmark_dates(iid, s, e, db_path=db)
+    if not missing:
+        return {
+            "index_id": iid,
+            "upserted": 0,
+            "attempted": 0,
+            "errors": 0,
+            "source": "nse_archive_price",
+        }
+    rows = []
+    attempted = 0
+    errors = 0
+    for d in missing[: int(max_requests)]:
+        if datetime.strptime(d, "%Y-%m-%d").weekday() >= 5:
+            continue
+        attempted += 1
+        try:
+            lvl = _fetch_nse_index_close(d, name)
+        except Exception:  # noqa: BLE001
+            lvl = None
+        if lvl is not None:
+            rows.append({
+                "index_id": iid,
+                "trade_date": d,
+                "level": lvl,
+                "raw_value": lvl,
+                "source": "nse_archive_price",
+                "provider": "nse",
+                "verification_status": "provisional",
+            })
+        else:
+            errors += 1
+    n = MarketDataStore(db).upsert_index_tri(rows) if rows else 0
+    return {
+        "index_id": iid,
+        "upserted": n,
+        "attempted": attempted,
+        "errors": errors,
+        "source": "nse_archive_price",
+    }

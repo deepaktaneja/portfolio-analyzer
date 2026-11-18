@@ -36,4 +36,3 @@ def create_nav_adapter(provider: str = "manual", **kwargs) -> MFNavAdapter:
     if provider == "manual":
         return ManualCsvNavAdapter(**kwargs)
     raise ValueError(f"Unknown NAV provider: {provider}")
-print("mf/nav.py created")

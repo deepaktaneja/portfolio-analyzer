@@ -1,0 +1,42 @@
+# Stage 9 — Portfolio rebalancing & optimization targets (configurable).
+# Percentages are of total portfolio value. These are starting assumptions.
+asset_classes:
+  Equity:       {target: 65.0, min: 50.0, max: 80.0}
+  Debt:         {target: 25.0, min: 15.0, max: 40.0}
+  Gold:         {target: 5.0,  min: 0.0,  max: 15.0}
+  Alternatives: {target: 5.0,  min: 0.0,  max: 15.0}
+
+sector_caps:
+  Financials: 30.0
+  Technology: 25.0
+  Consumer: 20.0
+  Healthcare: 15.0
+  Energy: 12.0
+
+market_cap:
+  Large: {min: 50.0, max: 80.0}
+  Mid:   {min: 10.0, max: 30.0}
+  Small: {min: 0.0,  max: 20.0}
+
+mf_vs_direct:
+  mf_target: 40.0
+  direct_target: 60.0
+
+rebalancing:
+  strategy: threshold          # annual | threshold | on_demand
+  drift_tolerance: 5.0         # percentage points before triggering
+  min_trade_size: 10000        # Rs minimum per trade
+  max_turnover_pct: 30.0       # % of portfolio value that may be traded
+  prioritize_cash: true        # invest available cash before selling
+  prioritize_sip: true         # adjust SIPs before selling
+  respect_decision_signals: true
+  protect_compounders: true
+
+tax:
+  # Explicit overrides; date-effective rules auto-selected from effective_date when omitted.
+  equity_stcg_rate: null
+  equity_ltcg_rate: null
+  equity_ltcg_exemption: null
+  stt_rate: 0.001
+  ltcg_holding_days: 365
+  exit_load_default_pct: 0.0

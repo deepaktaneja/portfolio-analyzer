@@ -47,14 +47,21 @@ def compute_xirr(cashflows: Iterable[tuple]) -> float | None:
         return None
     if result is None:
         return None
+    # pyxirr returns a complex number when no real root exists (e.g. cash flows
+    # that change sign in a way that admits no real IRR). Reject those.
+    if isinstance(result, complex):
+        return None
     try:
         import math
 
         if math.isnan(result) or math.isinf(result):
             return None
-    except Exception:  # noqa: BLE001, S110
-        pass
-    return float(result)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return float(result)
+    except (TypeError, ValueError):
+        return None
 
 
 def annualize_pct(xirr_value: float | None) -> float | None:

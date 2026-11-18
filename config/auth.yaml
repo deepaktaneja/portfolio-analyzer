@@ -1,0 +1,11 @@
+# Stage 10 — optional authentication config.
+# Auth is DISABLED unless APP_AUTH_ENABLED=true (env). Prefer env vars for secrets:
+#   APP_USERNAME, APP_PASSWORD (or APP_PASSWORD_SHA256 hex), APP_ROLE
+enabled: false
+
+# Role → permissions are defined in app/auth.py (view, run_jobs, backup, settings, ack_alerts).
+# File-based users (dev/local only). Use `sha256:<hex>` instead of plaintext where possible.
+users: []
+#  - username: admin
+#    password: "sha256:<hex-sha256-of-password>"
+#    role: admin

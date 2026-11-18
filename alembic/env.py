@@ -13,12 +13,13 @@ from alembic import context
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.db import Base
+from models.research import ResearchBase
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+target_metadata = [Base.metadata, ResearchBase.metadata]
 
 
 def run_migrations_offline() -> None:

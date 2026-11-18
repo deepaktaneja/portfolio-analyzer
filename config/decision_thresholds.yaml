@@ -1,0 +1,52 @@
+# Stage 8 — Decision engine thresholds (configurable starting assumptions).
+# These are NOT automatic sell rules; they are advisory thresholds for review.
+equity:
+  concentration:
+    portfolio_pct_threshold: 12.0     # flag if single stock exceeds this % of portfolio
+    target_deviation_pct: 50.0        # flag if weight > target * (1 + this/100)
+  valuation:
+    forward_pe_percentile_threshold: 80   # percentile vs own history
+    peg_threshold: 2.0                     # PEG above this is expensive
+    sector_pe_percentile: 90
+  rapid_appreciation:
+    price_gain_threshold: 0.80        # +80% in the window
+    earnings_upgrade_threshold: 0.10  # <+10% EPS upgrade = not justified
+    window_months: 6
+  fundamental:
+    revenue_decline_qoq: -0.05
+    eps_downgrade: -0.10
+    margin_decline: -0.02             # absolute margin compression
+    fcf_decline: -0.15
+  governance:
+    promoter_pledging_threshold: 0.20
+    auditor_concerns: true
+    related_party_threshold_cr: 100.0
+  forward_returns:
+    expected_return_threshold: 0.08   # 3y CAGR below this flags low forward return
+    horizon_years: 3
+
+mutual_fund:
+  underperformance:
+    benchmark_gap_1y: -0.05
+    benchmark_gap_3y: -0.03
+  risk_adjusted:
+    sharpe_threshold: 0.0
+    consistency_threshold: 0.40       # beat benchmark < 40% of rolling windows
+  overlap:
+    weight_overlap_threshold: 30.0
+    jaccard_threshold: 0.4
+  expenses:
+    expense_ratio_threshold: 1.5       # % (budget funds/peers aware)
+  manager:
+    manager_changes_threshold: 2
+  concentration:
+    top5_threshold: 50.0
+    single_stock_threshold: 15.0
+
+engine:
+  llm_enabled: true
+  llm_required_for: ["EXIT_REVIEW", "REPLACEMENT_REVIEW"]
+  min_confidence_for_review: 0.55
+  protect_compounders: true            # do not EXIT purely on valuation/appreciation
+  compounder_min_growth: 0.15          # 3y CAGR that qualifies as a compounder
+  governance_escalates_independently: true

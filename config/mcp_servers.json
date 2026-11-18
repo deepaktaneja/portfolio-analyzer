@@ -1,0 +1,38 @@
+{
+  "servers": [
+    {
+      "name": "company-research",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "screener-mcp[ai]", "screener-mcp"],
+      "enabled": true,
+      "max_concurrency": 2,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "bulk-screener",
+      "transport": "stdio",
+      "command": "bulk-screener-adapter",
+      "args": [],
+      "enabled": true,
+      "max_concurrency": 1,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "nse-history",
+      "transport": "streamable_http",
+      "url": "https://mcp.nseindia.in/bhavcopy/cm/mcp",
+      "enabled": true,
+      "max_concurrency": 2,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "nse-market",
+      "transport": "streamable_http",
+      "url": "https://mcp.nseindia.in/cmmkt/mcp",
+      "enabled": false,
+      "max_concurrency": 1,
+      "timeout_seconds": 30
+    }
+  ]
+}

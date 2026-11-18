@@ -116,37 +116,52 @@ class SQLiteStore:
                     source TEXT,
                     verification_status TEXT NOT NULL DEFAULT 'unresolved',
                     notes TEXT,
+                    person_id INTEGER,
                     created_at TEXT NOT NULL,
                     UNIQUE (security_id, ledger_opening_date)
                 )"""
             )
+            try:
+                conn.execute("ALTER TABLE opening_positions ADD COLUMN person_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
-    def add_opening_position(self, security_id, ledger_opening_date, opening_qty, original_acq_date=None, original_acq_cost=None, source=None, verification_status='unresolved', notes=None):
+    def add_opening_position(self, security_id, ledger_opening_date, opening_qty, original_acq_date=None, original_acq_cost=None, source=None, verification_status='unresolved', notes=None, person_id=None):
         self._ensure_opening_table()
         from datetime import datetime
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO opening_positions (security_id, ledger_opening_date, opening_qty, original_acq_date, original_acq_cost, source, verification_status, notes, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)
+                """INSERT INTO opening_positions (security_id, ledger_opening_date, opening_qty, original_acq_date, original_acq_cost, source, verification_status, notes, person_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(security_id, ledger_opening_date) DO UPDATE SET
                      opening_qty=excluded.opening_qty,
                      original_acq_date=excluded.original_acq_date,
                      original_acq_cost=excluded.original_acq_cost,
                      source=excluded.source,
                      verification_status=excluded.verification_status,
-                     notes=excluded.notes""",
-                (security_id.strip().upper(), ledger_opening_date, float(opening_qty), original_acq_date, original_acq_cost, source, verification_status, notes, datetime.now(UTC).isoformat()),
+                     notes=excluded.notes,
+                     person_id=excluded.person_id""",
+                (security_id.strip().upper(), ledger_opening_date, float(opening_qty), original_acq_date, original_acq_cost, source, verification_status, notes, person_id, datetime.now(UTC).isoformat()),
             )
             conn.commit()
 
-    def get_opening_positions(self, security_id=None):
+    def get_opening_positions(self, security_id=None, person_id=None):
         self._ensure_opening_table()
-        with self._conn() as conn:
-            if security_id:
-                rows = conn.execute("SELECT * FROM opening_positions WHERE security_id=?", (security_id.strip().upper(),)).fetchall()
+        conds = []
+        params = []
+        if security_id:
+            conds.append("security_id=?")
+            params.append(security_id.strip().upper())
+        if person_id is not None:
+            if int(person_id) == -1:
+                conds.append("person_id IS NULL")
             else:
-                rows = conn.execute("SELECT * FROM opening_positions").fetchall()
+                conds.append("person_id=?")
+                params.append(int(person_id))
+        q = "SELECT * FROM opening_positions" + (" WHERE " + " AND ".join(conds) if conds else "")
+        with self._conn() as conn:
+            rows = conn.execute(q, tuple(params)).fetchall()
         return [dict(r) for r in rows]
 
     def delete_opening_position(self, security_id, ledger_opening_date):

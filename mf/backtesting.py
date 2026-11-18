@@ -12,11 +12,11 @@ from models.mf import MFTransaction, MFPortfolio
 from src.xirr import compute_xirr, annualize_pct
 
 BUY_SIDES = frozenset({
-    "SIP", "PURCHASE", "BUY", "LUMP_SUM", "SUBSCRIPTION", "allotment",
-    "bonus", "growth", "accumulation", "reinvest",
+    "SIP", "PURCHASE", "BUY", "LUMP_SUM", "SUBSCRIPTION", "ALLOTMENT",
+    "BONUS", "GROWTH", "ACCUMULATION", "REINVEST", "SWITCH_IN", "STP_IN",
 })
 SELL_SIDES = frozenset({
-    "REDEMPTION", "SWITCH_OUT", "SWP", "WITHDRAW", "SELL",
+    "REDEMPTION", "SWITCH_OUT", "SWP", "WITHDRAW", "SELL", "STP_OUT",
 })
 
 
@@ -312,40 +312,13 @@ def calculate_realized_unrealized_gains(
     transactions: List[Dict[str, Any]],
     nav_data: Dict[str, Decimal],
 ) -> Dict[str, Dict[str, Any]]:
-    """Calculate realized and unrealized gains per security."""
-    from mf.accounting import build_folio_units
-    holdings = build_folio_units(transactions)
-    invested: Dict[str, Decimal] = {}
-    redeemed: Dict[str, Decimal] = {}
+    """FIFO cost-basis realized/unrealized gains (delegates to mf.accounting).
 
-    for t in transactions:
-        side = str(t.get("side", "")).upper()
-        amt = Decimal(str(t.get("amount") or t.get("net_amount") or 0))
-        sid = t.get("isin") or t.get("security")
-        if side in BUY_SIDES:
-            invested[sid] = invested.get(sid, Decimal("0")) + amt
-        elif side in SELL_SIDES:
-            redeemed[sid] = redeemed.get(sid, Decimal("0")) - amt
-
-    result: Dict[str, Dict[str, Any]] = {}
-    for sid, units in holdings.items():
-        nav = nav_data.get(sid, Decimal("0"))
-        current_val = units * nav if nav > 0 else Decimal("0")
-        inv = invested.get(sid, Decimal("0"))
-        red = redeemed.get(sid, Decimal("0"))
-        realized = red - inv if inv > 0 else Decimal("0")
-        unrealized = current_val - max(Decimal("0"), inv - red)
-        result[sid] = {
-            "units": float(units),
-            "nav": float(nav) if nav else None,
-            "current_value": float(current_val),
-            "invested": float(inv),
-            "redeemed": float(red),
-            "realized_gain": float(realized),
-            "unrealized_gain": float(unrealized),
-            "missing_nav": nav <= 0,
-        }
-    return result
+    Stage 11 audit: previous implementation mis-signed redemption proceeds and
+    treated net-invested as cost basis. Now consistent with mf.accounting.
+    """
+    from mf.accounting import calculate_realized_unrealized_gains as _fifo_gains
+    return _fifo_gains(transactions, nav_data)
 
 
 def compare_portfolios(

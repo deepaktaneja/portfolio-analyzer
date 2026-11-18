@@ -192,7 +192,7 @@ def calculate_stock_xirr(transactions, actions=None, dividends=None, price_looku
             flows.append((dd, amt, "dividend"))
     for dd, amt in _rights_flows(actions, sid, sd, ed):
         flows.append((dd, amt, "rights_subscription"))
-    rq = _holdings_qty(transactions, sid, ed, opening_positions)
+    rq = max(0.0, _holdings_qty(transactions, sid, ed, opening_positions))
     if rq and price_lookup is not None:
         try:
             tp = price_lookup(sid, ed)
@@ -201,10 +201,17 @@ def calculate_stock_xirr(transactions, actions=None, dividends=None, price_looku
         if tp is not None:
             flows.append((ed, rq * float(tp), "terminal_value"))
     x = compute_xirr([(d, a) for d, a, _ in flows])
+    if rq and flows and flows[-1][2] != "terminal_value":
+        return {
+            "xirr": None,
+            "cashflows": flows,
+            "reason": "missing_terminal_price",
+            "missing_prices": [sid],
+        }
     return {"xirr": x, "cashflows": flows}
 
 
-def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None, opening_positions=None):
+def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_lookup=None, start_date=None, end_date=None, holdings_at_end=None, opening_positions=None):
     txs = [t for t in (transactions or []) if _is_trade(t)]
     if not txs:
         return {"xirr": None, "cashflows": [], "reason": "no_trades"}
@@ -228,7 +235,7 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
                     ov += float(q) * float(p)
                 else:
                     ok = False
-        if ok and ov:
+        if ov:
             flows.append((sd, -ov, "opening_value"))
     for t in txs:
         dd = _to_date(_trade_date(t))
@@ -250,8 +257,14 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
     tv = 0.0
     tok = True
     holdings_ed = _holdings_as_of(transactions, ed, opening_positions)
-    for sid in secs:
-        q = holdings_ed.get(sid, 0.0)
+    if holdings_at_end is not None:
+        terminal_qty = {str(k).strip().upper(): max(0.0, float(v or 0.0)) for k, v in holdings_at_end.items()}
+    else:
+        terminal_qty = {k: max(0.0, float(v)) for k, v in holdings_ed.items()}
+    terminal_sids = sorted(set(secs) | set(terminal_qty))
+    missing_prices = []
+    for sid in terminal_sids:
+        q = terminal_qty.get(sid, 0.0)
         if q and price_lookup is not None:
             try:
                 p = price_lookup(sid, ed)
@@ -261,11 +274,14 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
                 tv += float(q) * float(p)
             else:
                 tok = False
-    if tok and tv:
+                missing_prices.append(sid)
+    if tv:
         flows.append((ed, tv, "terminal_value"))
     _amounts = [a for _, a, _ in flows]
     if not (_amounts and min(_amounts) < 0 < max(_amounts)):
         _reason = "invalid_cashflows"
+    elif not tok and tv:
+        _reason = "partial_terminal_price"
     elif not tok:
         _reason = "missing_terminal_price"
     else:
@@ -273,7 +289,14 @@ def calculate_portfolio_xirr(transactions, actions=None, dividends=None, price_l
     x = compute_xirr([(d, a) for d, a, _ in flows])
     if x is None and _reason is None:
         _reason = "solver_failed"
-    return {"xirr": x, "cashflows": flows, "reason": _reason}
+    if _reason in ("missing_terminal_price", "invalid_cashflows"):
+        x = None
+    return {
+        "xirr": x,
+        "cashflows": flows,
+        "reason": _reason,
+        "missing_prices": missing_prices,
+    }
 
 
 def calculate_investment_cycle_xirr(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, opening_positions=None):
@@ -420,6 +443,162 @@ def calculate_portfolio_twr(transactions, actions=None, dividends=None, price_lo
             _has_valid = True
     return (twr - 1.0) if (_has_valid and len(dates) > 1) else None
 
+
+def portfolio_value_series(transactions, price_lookup=None, start_date=None, end_date=None,
+                           opening_positions=None, monthly=True):
+    """Portfolio market value on periodic snapshots over ``[start_date, end_date]``.
+
+    Risk analytics (volatility, Sharpe, Sortino, max drawdown) need a *value*
+    series rather than irregular cash flows. Quantities are reconstructed as of
+    each snapshot date and priced with ``price_lookup`` (which resolves the last
+    known close on or before the date). Snapshot dates are the range endpoints
+    plus each calendar month-end inside the range. Returns ``[(date, value)]``.
+
+    A snapshot whose securities all lack a price contributes a ``0.0`` value, so
+    callers can decide whether the coverage is good enough to use the series.
+    """
+    if price_lookup is None:
+        return []
+    txs = [t for t in (transactions or []) if _is_trade(t)]
+    if not txs:
+        return []
+    first = min(_to_date(_trade_date(t)) for t in txs)
+    sd = _to_date(start_date) if start_date is not None else first
+    ed = _to_date(end_date) if end_date is not None else max(_to_date(_trade_date(t)) for t in txs)
+    if sd > ed:
+        return []
+    snapshots = {sd, ed}
+    if monthly:
+        from datetime import timedelta
+        cursor = date(sd.year, sd.month, 1)
+        while cursor <= ed:
+            nxt = date(cursor.year + (cursor.month // 12), (cursor.month % 12) + 1, 1)
+            month_end = nxt - timedelta(days=1)
+            if sd < month_end < ed:
+                snapshots.add(month_end)
+            cursor = nxt
+    secs = sorted({_isin(t) for t in txs})
+    out = []
+    for d in sorted(snapshots):
+        quantities = _holdings_as_of(transactions, d, opening_positions)
+        value = 0.0
+        for sid in sorted(set(secs) | set(quantities)):
+            q = quantities.get(sid, 0.0)
+            if not q:
+                continue
+            try:
+                p = price_lookup(sid, d)
+            except Exception:  # noqa: BLE001
+                p = None
+            if p is not None:
+                value += float(q) * float(p)
+        out.append((d, value))
+    return out
+
+
+def calculate_portfolio_snapshot(transactions, price_lookup=None, as_of_date=None,
+                                 opening_positions=None):
+    """Portfolio market value and cost basis as of a specific date.
+
+    Reconstructs FIFO lots from opening positions + trades up to ``as_of_date``
+    (corporate actions are intentionally not applied here, matching the holding
+    layer used by :func:`calculate_portfolio_xirr`), values the remaining units
+    with ``price_lookup`` and returns::
+
+        portfolio_value  – sum(qty x price) of holdings at the date
+        invested_capital – remaining FIFO cost basis of those holdings
+        gains            – portfolio_value - invested_capital
+        holdings         – {isin: quantity}
+        missing_prices   – ISINs held at the date with no price
+
+    ``as_of_date=None`` means "use every transaction" (no cutoff). Opening
+    positions contribute their ``original_acq_cost`` as cost basis when known.
+    """
+    cutoff = _to_date(as_of_date) if as_of_date is not None else None
+    events = []
+    for op in (opening_positions or []):
+        try:
+            od = _to_date(op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date)
+        except Exception:  # noqa: BLE001
+            od = None
+        if od is None or (cutoff is not None and od > cutoff):
+            continue
+        isin = str((op.get("security_id") if isinstance(op, dict) else getattr(op, "security_id", None)) or "").strip().upper()
+        if not isin:
+            continue
+        qty = op.get("opening_qty") if isinstance(op, dict) else getattr(op, "opening_qty", None)
+        cost = op.get("original_acq_cost") if isinstance(op, dict) else getattr(op, "original_acq_cost", None)
+        try:
+            qty = float(qty or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            cost = float(cost) if cost is not None else None
+        except (TypeError, ValueError):
+            cost = None
+        if qty > 0:
+            events.append((od, 0, isin, "OPENING", qty, cost))
+    for t in (transactions or []):
+        if not _is_trade(t):
+            continue
+        dd = _to_date(_trade_date(t))
+        if cutoff is not None and dd > cutoff:
+            continue
+        isin = _isin(t)
+        if not isin:
+            continue
+        events.append((dd, 1, isin, _side(t), _qty(t), _cost(t)))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    lots: dict[str, list[list[float]]] = defaultdict(list)  # isin -> [[qty, total_cost], ...]
+    for _dd, _order, isin, side, q, c in events:
+        if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+            if q <= 0:
+                continue
+            lots[isin].append([q, float(c or 0.0)])
+        elif side == "SELL":
+            remaining = q
+            for lot in lots.get(isin, []):
+                if remaining <= TOL:
+                    break
+                take = min(lot[0], remaining)
+                ratio = (take / lot[0]) if lot[0] else 0.0
+                lot[1] -= lot[1] * ratio
+                lot[0] -= take
+                remaining -= take
+            lots[isin] = [lot for lot in lots.get(isin, []) if lot[0] > TOL]
+
+    holdings: dict[str, float] = {}
+    invested_capital = 0.0
+    for isin, ls in lots.items():
+        qty = sum(lot[0] for lot in ls)
+        if qty <= TOL:
+            continue
+        holdings[isin] = qty
+        invested_capital += sum(lot[1] for lot in ls)
+
+    portfolio_value = 0.0
+    missing = []
+    for isin, qty in holdings.items():
+        price = None
+        if price_lookup is not None:
+            try:
+                price = price_lookup(isin, as_of_date)
+            except Exception:  # noqa: BLE001
+                price = None
+        if price is None:
+            missing.append(isin)
+            continue
+        portfolio_value += float(qty) * float(price)
+
+    return {
+        "as_of_date": cutoff,
+        "portfolio_value": portfolio_value,
+        "invested_capital": invested_capital,
+        "gains": portfolio_value - invested_capital,
+        "holdings": holdings,
+        "missing_prices": sorted(missing),
+    }
 
 
 def get_xirr_cashflow_audit(transactions, actions=None, dividends=None, price_lookup=None, security_id=None, start_date=None, end_date=None, scope="stock", opening_positions=None):
