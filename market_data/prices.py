@@ -43,6 +43,7 @@ def get_stock_prices(security_id, start, end, db_path=None, exchange=None):
 
 _FETCH_CACHE: dict[tuple[str, str, str, str], list[tuple[str, float]]] = {}
 _FETCH_MISSES: set[tuple[str, str, str, str]] = set()
+_LAST_FETCH_TS: list[float] = [0.0]
 
 
 def _db_path(db_path=None) -> str:

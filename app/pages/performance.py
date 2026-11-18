@@ -6,6 +6,7 @@ concentration breakdowns, risk-adjusted metrics, gains & dividends.
 """
 from __future__ import annotations
 
+import math
 import os
 
 import pandas as pd
@@ -1151,6 +1152,637 @@ def _render_whatif_simulator(ctx: AppContext) -> None:
             st.plotly_chart(fig, width="stretch")
 
 
+def _inr_indian(n) -> str:
+    """Format an integer with Indian digit grouping (e.g. 250000 -> '2,50,000')."""
+    try:
+        s = str(round(float(n)))
+    except (TypeError, ValueError):
+        return str(n)
+    if len(s) <= 3:
+        return s
+    head, tail = s[:-3], s[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return ",".join(parts) + "," + tail
+
+
+def _stage4_playbook_markdown(live: dict) -> str:
+    """Build the full Strategy Playbook markdown with live-synced parameters."""
+    trim_aer = live.get("trim_aer", 1.85)
+    stop_mult = live.get("stop_mult", 1.5)
+    min_mv = live.get("min_mv", 200000)
+    bench = live.get("bench_xirr", 0.12)
+    budget = live.get("budget", 300000)
+    inc_max = live.get("inc_max", 100000)
+    inc_days = live.get("inc_days", 180)
+    inc_gtt = live.get("inc_gtt", 0.60)
+    gtt_warn = live.get("gtt_warn", 0.10)
+    max_weight_pct = live.get("max_weight_pct", 8.0)
+    L = []
+    L.append("# Strategy Playbook & Rulebook — Direct Equity")
+    L.append("")
+    L.append(f"_Live parameters: Profit-Trim AER {trim_aer:.2f}x · Vol Stop-Loss {stop_mult:.1f}x · "
+             f"Min Trim Size ₹{_inr_indian(min_mv)} · Benchmark XIRR {bench * 100:.0f}% · "
+             f"Monthly SIP Budget ₹{_inr_indian(budget)}_")
+    L.append("")
+    L.append("## 1. Core Philosophy & Monthly Cadence")
+    L.append("Once-a-month review (~15 minutes) before deploying the monthly SIPs, using 100% "
+             "mathematical formulas (zero manual stock bucketing) computed locally from daily "
+             "Adjusted Close prices.")
+    L.append("")
+    L.append("## 2. New SIP Incubation Gate (Protecting the first SIPs)")
+    L.append(f"Any stock with Invested Cost < ₹{_inr_indian(inc_max)} OR Holding Age < {inc_days} days stays "
+             "in **Incubation Mode**.")
+    L.append("- Locked at **1.0x** base SIP for rupee-cost averaging; profit trims & laggard exits are suppressed.")
+    L.append(f"- Protected solely by a **{int((1 - inc_gtt) * 100)}% Catastrophe Circuit Breaker** "
+             f"(Avg Buy Price × {inc_gtt:.2f}).")
+    L.append("")
+    L.append("## 3. Monthly SIP Deployment - 4-Lane Guide (Rs 5,000 units)")
+    L.append("All-weather discipline (never chase vertical peaks). Each stock lands in one lane from its 200-DMA distance and AER:")
+    L.append("- **Lane 1 (2.5x Resting Winner)** - 0% to +15% above 200-DMA, XIRR > Bench + 10%, AER < 1.30: double up on proven winners resting (cap Rs 35,000).")
+    L.append("- **Lane 2 (1.0x Cruising / Incubating)** - 0% to +30% above 200-DMA, 0.85 <= AER < 1.35: steady accumulation (Incubating locked 1.0x).")
+    L.append("- **Lane 3 (0.0x Overheated Rocket)** - more than +30% above 200-DMA OR AER >= 1.35: stop fresh money, keep shares compounding. Not a warning.")
+    L.append("- **Lane 4 (0.0x Broken Trend)** - below 200-DMA OR AER < 0.85: freeze SIPs, verify GTT, exit 100% only on GTT or AER <= 0.50.")
+    L.append("Every SIP is an exact Rs 5,000 multiple and capped at Rs 35,000 per stock; leftover parks in Liquid Fund / Dry Powder; sub-Rs 5,000 shows as Carry-Forward Cash.")
+    L.append("## 4. The 4-Tier Sell & Profit-Booking Ladder (Priority Order)")
+    L.append(f"**Priority 1 — Hard Volatility Stop-Loss (100% Exit):** Invested ≥ ₹1,50,000 AND "
+             f"(CMP ≤ Avg Buy × (1 − StopLoss%) where StopLoss% = clamp({stop_mult:.1f}×AnnualVol, 20%, 45%), "
+             "OR AER ≤ 0.50). Always exit 100% in one go (no partial stop-loss exits). The Auto GTT Stop-Loss "
+             "Trigger = **max(Cost Floor, Trailing Peak Floor)**: once a winner is ≥ +100% (2.0x) over avg cost, the GTT "
+             "ratchets up to Peak × (1 − clamp(1.5×AnnualVol, 35%, 45%)) to protect profits; otherwise it sits at "
+             "the Cost Floor = Avg Buy × (1 − StopLoss%).")
+    L.append("**Priority 2 — Trend-Break Profit Lock (50% Exit):** AER ≥ 1.30 AND CMP < 50-DMA × 0.95 "
+             "(confirmed 5% break below 50-DMA) to lock in gains before a full reversal.")
+    L.append(f"**Priority 3 — Concentration Trim (Reset to 1.40×):** AER ≥ {trim_aer:.2f} "
+             f"(Market Weight > {trim_aer:.2f}× Cost Weight), Market Value ≥ ₹{_inr_indian(min_mv)}, and XIRR > 25%. "
+             "Trim just enough shares (FIFO, LTCG > 365 days first, to minimize tax) to bring Market Weight "
+             "back to 1.40× Cost Weight.")
+    L.append("**Priority 4 — Opportunity-Cost Laggard Exit:** Flags non-incubating stocks held > 365 days "
+             "in the Bottom 5 with Efficiency Score < 0 and CMP < 200-DMA for review & reallocation.")
+    L.append("")
+    L.append("## 5. Warning Level Protocol (3-Step Checklist)")
+    L.append(f"Triggers when a stock is frozen at 0.0x by a **Trend Freeze** (CMP < 200-DMA or AER < 0.85) OR sits "
+             f"within {int(gtt_warn * 100)}% of its GTT stop. The 0.0x **Over-Allocated Freeze** is NOT a warning "
+             "(that is simply 'let winners run').")
+    L.append("1. **Do Not Sell Existing Shares Yet** (avoid false-alarm whipsaws).")
+    L.append("2. **Pause Fresh SIPs (0.0x)** and redirect capital to winners.")
+    L.append("3. **Verify Active Broker GTT Order & 2-Minute Thesis Check** — exit 100% immediately only "
+             "if there is a permanent governance, fraud, or severe financial/NBFC red flag.")
+    L.append("")
+    L.append("## 6. Laggard Exit (LAGGARD_EXIT) — 2-Minute Decision Filter")
+    L.append("LAGGARD_EXIT is a **Priority 4 Review Flag**, not an automatic panic sell — eliminate dead money:")
+    L.append("- **Hold (keep SIP at 0.0x):** Quarterly YoY Revenue/Profit growth still > 15% "
+             "(business is compounding; valuation is just cooling off).")
+    L.append("- **Exit 100% & Reallocate:** Quarterly YoY Revenue/Profit growth stalled < 10% for 2 consecutive quarters.")
+    L.append("- **Tax-Loss Harvesting Bonus:** Prefer exiting stagnant laggards sitting at a loss during Feb–March "
+             "to offset realized LTCG/STCG taxes from AER ≥ 1.50x profit trims.")
+    L.append("")
+    L.append("## 7. Staggered Cash Redeployment Playbook")
+    L.append("Deploy cash freed up from HARD_STOP_LOSS, CONCENTRATION_TRIM, or LAGGARD_EXIT:")
+    L.append("1. **No Lump-Sum Chasing:** Park net proceeds immediately in a Liquid Fund / LIQUIDBEES.")
+    L.append("2. **Stagger Over 3–6 Monthly SIPs:** Divide the harvested cash pool into 3 equal monthly "
+             "tranches (if < ₹3,00,000) or 6 tranches (if ≥ ₹3,00,000) and feed them into the Stage 4C "
+             f"Monthly SIP Budget (₹{_inr_indian(budget)}) so 2.5x winners absorb capital gradually without "
+             "distorting AER cost weights.")
+    L.append("3. **New Replacement Exception:** Up to ₹50,000 starter deployment + ₹10,000 monthly SIPs "
+             "until reaching the ₹1,00,000 incubation graduation mark.")
+    L.append("")
+    L.append("_Tax refs: LTCG 12.5% above ₹1.25L annual exemption; STCG 20%. Advisory only — verify with your CA._")
+    return "\n".join(L)
+
+
+def _render_playbook_panel(live: dict) -> None:
+    """Render the scrollable playbook inside a popover/dialog with copy + download."""
+    md = _stage4_playbook_markdown(live)
+    st.download_button("📋 Copy Rulebook as Markdown", data=md.encode("utf-8"),
+                       file_name="strategy_playbook.md", mime="text/markdown", key="s4d_copy_md")
+    st.markdown(md)
+    with st.expander("View raw Markdown (copy text)"):
+        st.code(md, language="markdown")
+
+
+def _render_stage4_action_center(ctx: AppContext) -> None:
+    """Stage 4B - Sell / Profit-Booking / Stop-Loss Action Center (UI)."""
+    from datetime import date as _d
+
+    from performance import stage4_signals as s4
+
+    txs = ctx.txs
+    f = ctx.filters
+    _hc1, _hc2 = st.columns([5, 2])
+    with _hc1:
+        st.markdown("#### Stage 4 - Sell / Profit-Booking / Stop-Loss Action Center")
+        st.caption("Formula-driven action cards over local Adjusted-Close data. Advisory only - nothing is executed.")
+    with _hc2:
+        _live = {
+            "trim_aer": float(st.session_state.get("s4_trim_aer", s4.TRIM_AER)),
+            "stop_mult": float(st.session_state.get("s4_stop_mult", s4.STOP_LOSS_MULT)),
+            "min_mv": float(st.session_state.get("s4_min_mv", s4.TRIM_MIN_MARKET_VALUE)),
+            "bench_xirr": float(st.session_state.get("s4_bench_xirr", 0.12)),
+            "budget": float(st.session_state.get("s4c_budget", s4.DEFAULT_MONTHLY_SIP_BUDGET)),
+            "inc_max": float(s4.INCUBATION_MAX_INVESTED),
+            "inc_days": int(s4.INCUBATION_MAX_DAYS),
+            "inc_gtt": float(s4.INCUBATION_GTT_MULT),
+            "gtt_warn": float(s4.GTT_BUFFER_WARN),
+            "max_weight_pct": float(st.session_state.get("s4c_max_weight", 8.0)),
+        }
+        with st.popover("📖 Strategy Playbook & Rules", use_container_width=True):
+            _render_playbook_panel(_live)
+    if not txs:
+        st.info("No equity transactions available.")
+        return
+
+    st.markdown("**Formula Controls**")
+    cc = st.columns(4)
+    with cc[0]:
+        trim_aer = st.slider("Profit Trim AER Trigger", 1.20, 2.50, 1.85, 0.05, key="s4_trim_aer",
+                             help="Trim when AER >= this; weight resets to 1.40x cost weight.")
+    with cc[1]:
+        stop_mult = st.slider("Volatility Stop-Loss x", 1.0, 3.0, 1.5, 0.1, key="s4_stop_mult",
+                              help="Dynamic stop = clamp(mult x annual vol, 20%, 45%).")
+    with cc[2]:
+        min_mv = st.number_input("Min Position Size for Trim (Rs)", min_value=50000, max_value=5000000,
+                                 value=200000, step=50000, key="s4_min_mv")
+    with cc[3]:
+        bench_xirr = st.slider("Benchmark XIRR", 0.0, 0.30, 0.12, 0.01, key="s4_bench_xirr")
+
+    as_of = f.end_date or _d.today()
+    px = s4.make_adjusted_close_lookup(ctx.market_db_path)
+
+    active_isins = []
+    try:
+        if ctx.holdings is not None and not ctx.holdings.empty:
+            for _, r in ctx.holdings.iterrows():
+                if float(r.get("quantity") or 0) > 1e-6:
+                    sid = str(r.get("isin") or "").strip().upper()
+                    if sid:
+                        active_isins.append(sid)
+    except Exception:  # noqa: BLE001
+        active_isins = []
+    if not active_isins:
+        st.info("No active equity holdings to evaluate.")
+        return
+
+    key = ("s4_rows", tx_hash(txs), str(as_of)[:10], getattr(f, "person_id", None),
+           round(trim_aer, 3), round(stop_mult, 2), int(min_mv), round(bench_xirr, 3),
+           len(ctx.opening_positions or []))
+    cached = st.session_state.get(key)
+    if cached is None:
+        with st.spinner("Evaluating Stage 4 signals over Adjusted-Close history..."):
+            stocks = []
+            for sid in active_isins:
+                try:
+                    stocks.append(s4.build_stock_input(txs, px, as_of, sid,
+                                                       dividends=ctx.dividend_flows,
+                                                       opening_positions=ctx.opening_positions))
+                except Exception:  # noqa: BLE001, S112
+                    continue
+            totals = s4.build_portfolio_totals(stocks)
+            rows = s4.evaluate_signals(stocks, totals, bench_xirr, as_of_date=as_of,
+                                       trim_aer=trim_aer, stop_loss_mult=stop_mult,
+                                       min_market_value=float(min_mv))
+            by_id = {s.security_id: s for s in stocks}
+            for r in rows:
+                s = by_id.get(r["security_id"])
+                r["quantity"] = getattr(s, "quantity", 0.0)
+                r["avg_buy_price"] = getattr(s, "avg_buy_price", 0.0)
+                r["market_value"] = getattr(s, "market_value", None)
+                r["invested_cost"] = getattr(s, "invested_cost", 0.0)
+                r["xirr"] = getattr(s, "xirr", None)
+        cached = {"rows": rows}
+        st.session_state[key] = cached
+    rows = cached["rows"]
+
+    def _name(sid):
+        try:
+            return security_name(sid, txs, ctx.holdings) or sid
+        except Exception:  # noqa: BLE001
+            return sid
+
+    # ---- prioritized action cards ----------------------------------------
+    st.markdown("**Prioritized Sell & Trim Actions**")
+    action_rows = [r for r in rows if r["signal_type"] in (
+        s4.HARD_STOP_LOSS, s4.TREND_BREAK_LOCK, s4.CONCENTRATION_TRIM)]
+    action_rows.sort(key=lambda r: r["priority"])
+    if not action_rows:
+        st.success("No sell / trim actions triggered under the current thresholds.")
+    accents = {s4.HARD_STOP_LOSS: ("🔴", "#d64545"),
+               s4.TREND_BREAK_LOCK: ("🟠", "#d98b00"),
+               s4.CONCENTRATION_TRIM: ("🔵", "#1c7ed6")}
+    for r in action_rows:
+        sid = r["security_id"]
+        sig = r["signal_type"]
+        cmp_ = float(r.get("cmp") or 0.0)
+        qty = float(r.get("quantity") or 0.0)
+        aer = r.get("aer")
+        stop = r.get("dynamic_stop_loss_pct")
+        d200 = r.get("dma_200")
+        emoji, color = accents.get(sig, ("•", "#555"))
+        if sig == s4.HARD_STOP_LOSS:
+            shares = round(qty) if qty > 0 else 0
+            why = ("Volatility Stop-Loss breached" if "stop-loss" in (r.get("reason") or "")
+                   else "AER collapsed to 0.50x or below")
+            action = f"Exit 100% ({shares} shares, {inr(shares * cmp_)}) — {why}"
+        elif sig == s4.TREND_BREAK_LOCK:
+            shares = int(qty // 2)
+            action = (f"Sell 50% ({shares} shares, {inr(shares * cmp_)}) — price broke below "
+                      "50-DMA while AER >= 1.30")
+        else:
+            shares = int(r.get("shares_to_sell") or 0)
+            from_w = (r.get("market_weight_pct") or 0.0) * 100.0
+            to_w = (r.get("cost_weight_pct") or 0.0) * 100.0 * 1.40
+            action = (f"Sell {shares} shares ({inr(shares * cmp_)}) to reset weight from "
+                      f"{from_w:.1f}% to {to_w:.2f}%")
+        with st.container(border=True):
+            st.markdown(
+                f"<span style='color:{color};font-weight:700;font-size:1.05rem'>"
+                f"{emoji} {sig.replace('_', ' ')} — {_name(sid)}</span>",
+                unsafe_allow_html=True,
+            )
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("CMP", f"Rs {cmp_:,.1f}")
+            mc2.metric("AER", f"{aer:.2f}x" if aer is not None else "N/A")
+            mc3.metric("Dyn. Stop-Loss", f"{stop * 100:.1f}%" if stop is not None else "N/A")
+            above = cmp_ > d200 if (cmp_ and d200) else None
+            mc4.metric("200-DMA", (f"{'above' if above else 'below'} {d200:,.0f}" if d200 else "N/A"))
+            _gtt = r.get("gtt_stop_loss_price")
+            _anchor = r.get("gtt_anchor_type")
+            _ap = r.get("gtt_anchor_price")
+            if r.get("signal_type") == s4.HARD_STOP_LOSS:
+                st.caption("Auto GTT Stop-Loss Trigger: Exit Now (Do Not Set GTT)")
+            elif _gtt and _anchor:
+                _ap_txt = f" from ₹{_ap:,.0f}" if _ap else ""
+                st.caption(f"Auto GTT Stop-Loss Trigger: ₹{_gtt:,.1f} — {_anchor}{_ap_txt}")
+            elif _gtt:
+                st.caption(f"Auto GTT Stop-Loss Trigger: ₹{_gtt:,.1f}")
+            st.markdown(f"**Action:** {action}")
+            if shares > 0 and cmp_ > 0:
+                taxp = s4.fifo_tax_preview(txs, sid, shares, cmp_, as_of,
+                                           opening_positions=ctx.opening_positions)
+                tc1, tc2, tc3, tc4 = st.columns(4)
+                tc1.metric("LTCG / STCG shares",
+                           f"{taxp['ltcg_shares']:.0f} / {taxp['stcg_shares']:.0f}")
+                tc2.metric("Est. Realized Gain", inr(taxp["realized_gain"]))
+                tc3.metric("Est. Tax", inr(taxp["estimated_tax"]))
+                tc4.metric("Net Post-Tax Cash", inr(taxp["net_cash_unlocked"]))
+                st.caption("FIFO estimate — LTCG 12.5% above ₹1.25L (annual, portfolio-wide), STCG 20%. Pre-import opening lots carry unknown cost (₹0).")
+            st.caption(r.get("reason") or "")
+
+    # ---- opportunity-cost laggards (Bottom 5) ----------------------------
+    st.markdown("**Opportunity-Cost Laggards (Bottom 5)**")
+    st.info("**2-Minute Laggard Filter:** Check YoY Earnings Growth — **>15% = Hold** (SIP paused at 0.0x)  |  "
+            "**<10% for 2 quarters = Exit 100%** & Stagger Redeployment over 3–6 months.")
+
+    def _is_laggard(r):
+        eff = r.get("efficiency_score")
+        cmp_ = r.get("cmp")
+        d200 = r.get("dma_200")
+        hs = r.get("holding_start_date")
+        if eff is None or cmp_ is None or d200 is None or not hs:
+            return False
+        try:
+            held = (as_of - _d.fromisoformat(str(hs)[:10])).days
+        except Exception:  # noqa: BLE001
+            return False
+        return held > 365 and eff < 0 and cmp_ < d200
+
+    laggards = sorted([r for r in rows if _is_laggard(r)],
+                      key=lambda r: r["efficiency_score"])[:5]
+    if not laggards:
+        st.caption("No laggards flagged (need >365 days held, Efficiency < 0 and CMP < 200-DMA).")
+    else:
+        tbl = []
+        for r in laggards:
+            xirr = r.get("xirr")
+            alpha = (xirr - bench_xirr) if xirr is not None else None
+            tbl.append({
+                "Stock": _name(r["security_id"]),
+                "XIRR": fmt_pct(xirr) if xirr is not None else "N/A",
+                "Alpha vs Bench": fmt_pct(alpha) if alpha is not None else "N/A",
+                "AER": f"{r['aer']:.2f}x" if r.get("aer") is not None else "N/A",
+                "Market Value": inr(r.get("market_value")),
+            })
+        st.dataframe(pd.DataFrame(tbl), hide_index=True, width="stretch")
+        st.caption("Reallocation candidates: held > 1 year, Efficiency Score < 0 and price below 200-DMA.")
+
+
+def _render_stage4_planner(ctx: AppContext) -> None:
+    """Stage 4C - Monthly SIP Deployment, Warning Level & GTT Protection Planner."""
+    from datetime import date as _d
+
+    from performance import stage4_signals as s4
+
+    txs = ctx.txs
+    f = ctx.filters
+    st.markdown("#### Stage 4C - Monthly SIP & GTT Protection Planner")
+    st.caption("Plan this month's SIP deployment and verify broker GTT orders. Advisory only - nothing is executed.")
+    if not txs:
+        st.info("No equity transactions available.")
+        return
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        budget = st.number_input("Total Monthly SIP Budget (Rs)", min_value=0, max_value=50000000,
+                                 value=int(s4.DEFAULT_MONTHLY_SIP_BUDGET), step=25000, key="s4c_budget")
+    with c2:
+        include_harvest = st.checkbox("Include Harvested Cash (Stage 4B trims)", value=False,
+                                      key="s4c_harvest")
+    with c3:
+        max_single_stock_sip = st.number_input("Max Single-Stock SIP (Rs)", min_value=0, max_value=500000, value=int(s4.MAX_SINGLE_STOCK_SIP), step=5000, key="s4c_max_sip", help="Cap each stock monthly SIP; leftover parks in Liquid Fund.")
+    max_single_stock_sip = float(max_single_stock_sip)
+
+    as_of = f.end_date or _d.today()
+    px = s4.make_adjusted_close_lookup(ctx.market_db_path)
+
+    active_isins = []
+    try:
+        if ctx.holdings is not None and not ctx.holdings.empty:
+            for _, r in ctx.holdings.iterrows():
+                if float(r.get("quantity") or 0) > 1e-6:
+                    sid = str(r.get("isin") or "").strip().upper()
+                    if sid:
+                        active_isins.append(sid)
+    except Exception:  # noqa: BLE001
+        active_isins = []
+    if not active_isins:
+        st.info("No active equity holdings to plan for.")
+        return
+
+    key = ("s4c_rows", tx_hash(txs), str(as_of)[:10], getattr(f, "person_id", None),
+           len(ctx.opening_positions or []), round(max_single_stock_sip, 4),
+           len(st.session_state.get("s4c_incubation_entries", {})))
+    cached = st.session_state.get(key)
+    if cached is None:
+        with st.spinner("Building this month's SIP plan over Adjusted-Close history..."):
+            stocks = []
+            for sid in active_isins:
+                try:
+                    stocks.append(s4.build_stock_input(txs, px, as_of, sid,
+                                                       dividends=ctx.dividend_flows,
+                                                       opening_positions=ctx.opening_positions))
+                except Exception:  # noqa: BLE001, S112
+                    continue
+            totals = s4.build_portfolio_totals(stocks)
+            rows = s4.evaluate_signals(stocks, totals, 0.12, as_of_date=as_of)
+            by_id = {s.security_id: s for s in stocks}
+            for r in rows:
+                s = by_id.get(r["security_id"])
+                r["quantity"] = getattr(s, "quantity", 0.0)
+                r["market_value"] = getattr(s, "market_value", None)
+                r["xirr"] = getattr(s, "xirr", None)
+                r["avg_buy_price"] = getattr(s, "avg_buy_price", 0.0)
+        cached = {"rows": rows}
+        st.session_state[key] = cached
+    rows = cached["rows"]
+
+    def _name(sid):
+        try:
+            return security_name(sid, txs, ctx.holdings) or sid
+        except Exception:  # noqa: BLE001
+            return sid
+
+    harvested = 0.0
+    if include_harvest:
+        for r in rows:
+            _st = r.get("signal_type")
+            if _st == s4.CONCENTRATION_TRIM:
+                sh = int(r.get("shares_to_sell") or 0)
+            elif _st == s4.HARD_STOP_LOSS:
+                sh = int(r.get("quantity") or 0)
+            else:
+                sh = 0
+            cmp_ = r.get("cmp") or 0
+            if sh > 0 and cmp_ > 0:
+                tp = s4.fifo_tax_preview(txs, r["security_id"], sh, cmp_, as_of,
+                                         opening_positions=ctx.opening_positions)
+                harvested += float(tp["net_cash_unlocked"])
+
+    _inc_total_early = sum(float(e.get("starter_sip", 0.0)) for e in st.session_state.get("s4c_incubation_entries", {}).values())
+    _effective_budget = max(0.0, float(budget) - _inc_total_early)
+    alloc = s4.compute_monthly_sip_allocation(rows, _effective_budget, harvested_cash=harvested, max_single_stock_sip=max_single_stock_sip)
+    arows = sorted(alloc["rows"], key=lambda r: -float(r.get("sip_multiplier") or 0))
+    deploy = float(alloc["deployable_budget"])
+    active_buy = sum(1 for r in arows if float(r.get("sip_multiplier") or 0) > 0)
+    warn_count = sum(1 for r in arows if r.get("warning_level"))
+    near_gtt = sum(1 for r in arows
+                   if r.get("gtt_buffer_pct") is not None and r["gtt_buffer_pct"] <= s4.GTT_BUFFER_WARN)
+
+    allocated = float(alloc.get("total_allocated", deploy)) + _inc_total_early
+    parked = float(alloc.get("parked_cash", 0.0))
+    k = st.columns(5)
+    k[0].metric("Total Monthly Deployment (incl. Incubation)", inr(allocated))
+    k[1].metric("Park in Liquid Fund / Dry Powder", inr(parked))
+    k[2].metric("Active Buy Positions", str(active_buy))
+    k[3].metric("Warning / Frozen (0.0x)", str(warn_count))
+    k[4].metric("Near GTT Stop Alerts", str(near_gtt))
+    if harvested > 0:
+        st.caption("Includes " + inr(harvested) + " harvested cash from Stage 4B profit-booking.")
+    if alloc.get("carry_forward_cash"):
+        st.caption("Carry-Forward Cash (<₹5k): " + inr(alloc["carry_forward_cash"])
+                   + " — below the ₹5,000 rounding unit; rolls into next month.")
+
+    if alloc["all_frozen"]:
+        st.warning("All holdings are frozen at 0.0x (broad downturn below 200-DMA). "
+                   "Hold Cash / Park in Liquid Fund: " + inr(deploy) + " undeployed this month.")
+    if warn_count > 0:
+        st.info("**Warning Level — action required:** (1) Do NOT sell existing shares yet.  "
+                "(2) Pause fresh SIPs (0.0x).  (3) Verify your active broker GTT order & check for "
+                "governance / sector red flags.")
+
+    # ---- Smart New-Stock Entry & Incubation Pacing (Stage 4C enhancement) ---------------------
+    if "s4c_incubation_entries" not in st.session_state:
+        st.session_state["s4c_incubation_entries"] = {}
+    inc_entries: dict = st.session_state["s4c_incubation_entries"]
+
+    st.markdown("**+ Simulate New Stock Entry** (incubation pacing planner)")
+    _c1, _c2, _c3 = st.columns([3, 1, 1])
+    with _c1:
+        _new_tk = st.text_input("NSE Ticker", value="", key="s4c_new_ticker",
+                                help="e.g. SJS.NS, ZENTEC.NS, RADICO.NS, ARROWGREEN.NS, DRAGARWQ.NS")
+    with _c2:
+        _add_tk = st.button("Add to Incubation", key="s4c_add_ticker")
+    with _c3:
+        _rem_tk = st.selectbox("Remove", ["(none)"] + sorted(inc_entries.keys()),
+                               key="s4c_rem_ticker") if inc_entries else st.selectbox("Remove", ["(none)"],
+                                                                                     key="s4c_rem_ticker_empty",
+                                                                                     disabled=True)
+    if _add_tk and _new_tk:
+        _sid = str(_new_tk).strip().upper()
+        try:
+            _series = px.series(_sid, as_of) if hasattr(px, "series") else []
+            if not _series:
+                st.error(f"No price history found for {_sid} up to {as_of}.")
+            else:
+                _si = s4.StockInput(security_id=_sid, symbol=_sid, quantity=0.0,
+                                    avg_buy_price=0.0, invested_cost=0.0, market_value=0.0,
+                                    xirr=0.0, holding_start_date=as_of, price_series=_series,
+                                    price_dates=_series)
+                _tot = s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0)
+                _m = s4.analyzeStockSignals(_si, _tot, 0.12)
+                _starter = s4.incubation_starter_sip(_m)
+                inc_entries[_sid] = {
+                    "ticker": _sid,
+                    "cmp": _m.get("cmp") or _series[-1],
+                    "annual_volatility": _m.get("annual_volatility"),
+                    "dma200_distance_pct": _m.get("dma200_distance_pct"),
+                    "is_golden_cross": bool(_m.get("is_golden_cross")),
+                    "starter_sip": float(_starter["sip"]),
+                    "tier": _starter["tier"],
+                    "reason": _starter["reason"],
+                    "invested_cost": 0.0,
+                }
+                st.session_state["s4c_incubation_entries"] = inc_entries
+                st.rerun()
+        except Exception as _e:  # noqa: BLE001
+            st.error(f"Could not simulate {_sid}: {_e}")
+    if _rem_tk != "(none)" and _rem_tk in inc_entries:
+        del inc_entries[_rem_tk]
+        st.session_state["s4c_incubation_entries"] = inc_entries
+        st.rerun()
+
+    incubation_total = 0.0
+    inc_rows = []
+    if inc_entries:
+        st.markdown("**Incubation Pacing Table** (< ₹1,00,000 — staged deployment)")
+        for _tk in sorted(inc_entries):
+            _e = inc_entries[_tk]
+            _vol = _e["annual_volatility"]
+            _dist = _e["dma200_distance_pct"]
+            _sip = _e["starter_sip"]
+            incubation_total += _sip
+            _months = s4.months_to_graduate(_e["invested_cost"], _sip)
+            _badge_txt = {
+                "A": "🚀 Fast-Track ₹20k",
+                "B": "⚖️ Standard ₹10k",
+                "C": "🛡️ Toe-Hold ₹5k",
+            }.get(_e["tier"], _e["tier"])
+            inc_rows.append({
+                "Ticker": _tk,
+                "CMP": f"{_e['cmp']:,.1f}" if _e.get("cmp") else "N/A",
+                "Vol %": f"{_vol * 100:.1f}%" if _vol is not None else "N/A",
+                "200-DMA Dist %": f"{_dist * 100:+.1f}%" if _dist is not None else "N/A",
+                "Starter SIP": f"₹{_sip:,.0f}",
+                "Reason": f"{_badge_txt} — {_e['reason']}",
+                "Months to Graduate": _months,
+            })
+        st.dataframe(pd.DataFrame(inc_rows), hide_index=True, width="stretch")
+        st.caption("All incubation SIPs are exact ₹5,000 multiples. Tier A = low vol + golden cross + ideal pullback; "
+                   "Tier B = standard cruising zone; Tier C = overheated (>+30% above 200-DMA) or trend not confirmed.")
+        st.caption(f"Incubation monthly total: ₹{incubation_total:,.0f} — deducted from the monthly budget below.")
+
+    # ---- monthly execution table ----------------------------------------
+    def _badge(r):
+        if r.get("signal_type") == s4.HARD_STOP_LOSS:
+            return "0.0x EXIT 100% (Hard Stop-Loss Triggered)"
+        if r.get("signal_type") == s4.LAGGARD_EXIT:
+            return "0.0x LAGGARD EXIT (Held >1Yr & Trailing Benchmark)"
+        if r.get("run_up_freeze") or r.get("over_allocated"):
+            return "0.0x Run-Up / Over-Allocated - Pause SIP (Hold Winners)"
+        inc = r.get("incubation")
+        sip = float(r.get("sip_multiplier") or 0.0)
+        if sip >= 2.5:
+            return "2.5x Resting Winner"
+        if sip >= 1.0:
+            return "1.0x Incubating" if inc else "1.0x Cruising Stock"
+        return "0.0x Broken Trend - Hold & Verify GTT"
+
+    def _dma_dist(r):
+        cmp_ = r.get("cmp")
+        d200 = r.get("dma_200")
+        if cmp_ and d200 and d200 > 0:
+            pct = (cmp_ - d200) / d200 * 100.0
+            return f"{pct:+.1f}% {'above' if pct >= 0 else 'below'}"
+        return "N/A"
+
+    st.markdown("**Monthly Execution Table**")
+    disp_rows = []
+    amber_flags = []
+    csv_rows = []
+    for r in arows:
+        is_hard_stop = r.get("signal_type") == s4.HARD_STOP_LOSS
+        am = (not is_hard_stop) and (
+            bool(r.get("warning_level"))
+            or (r.get("gtt_buffer_pct") is not None and r["gtt_buffer_pct"] <= s4.GTT_BUFFER_WARN)
+        )
+        amber_flags.append(am)
+        stage = "Incubating" if r.get("incubation") else "Graduated"
+        sip_amt = float(r.get("recommended_sip_rupees") or 0.0)
+        if is_hard_stop:
+            gtt_disp = "Exit Now (Do Not Set GTT)"
+        elif r.get("gtt_stop_loss_price"):
+            _anchor = r.get("gtt_anchor_type") or ""
+            _ap = r.get("gtt_anchor_price")
+            if _anchor and _ap:
+                gtt_disp = f"{r['gtt_stop_loss_price']:,.1f} ({_anchor} from ₹{_ap:,.0f})"
+            else:
+                gtt_disp = f"{r['gtt_stop_loss_price']:,.1f}"
+        else:
+            gtt_disp = "N/A"
+        disp_rows.append({
+            "Stock": _name(r["security_id"]),
+            "CMP": f"{r['cmp']:,.1f}" if r.get("cmp") else "N/A",
+            "Stage": stage,
+            "200-DMA": _dma_dist(r),
+            "AER": f"{r['aer']:.2f}x" if r.get("aer") is not None else "N/A",
+            "Signal": _badge(r),
+            "SIP (Rs)": f"{sip_amt:,.0f}",
+            "Shares": str(r.get("est_shares") or 0),
+            "GTT (Rs)": gtt_disp,
+            "Buffer": f"{r['gtt_buffer_pct'] * 100:.1f}%" if r.get("gtt_buffer_pct") is not None else "N/A",
+            "Verify": "⚠ GTT" if am else "",
+        })
+        if is_hard_stop:
+            _action = "EXIT_HARD_STOP"
+        elif float(r.get("sip_multiplier") or 0) > 0:
+            _action = "BUY"
+        else:
+            _action = "WARNING_HOLD_VERIFY_GTT"
+        csv_rows.append({
+            "Stock Ticker": r["security_id"],
+            "Stage": stage,
+            "Action": _action,
+            "Lane / Signal": _badge(r),
+            "SIP Amount (Rs)": round(sip_amt, 2),
+            "Est. Shares": int(r.get("est_shares") or 0),
+            "Updated GTT Trigger (Rs)": round(float(r.get("gtt_stop_loss_price") or 0.0), 2),
+            "GTT Anchor Type": r.get("gtt_anchor_type") or "",
+        })
+
+    df_disp = pd.DataFrame(disp_rows)
+
+    def _hl(row):
+        color = "background-color: #fff3cd; color: #7a5c00" if amber_flags[row.name] else ""
+        return [color] * len(row)
+
+    try:
+        st.dataframe(df_disp.style.apply(_hl, axis=1), hide_index=True, width="stretch")
+    except Exception:  # noqa: BLE001
+        st.dataframe(df_disp, hide_index=True, width="stretch")
+    st.caption("Rows highlighted amber are Warning Level or within 10% of the GTT trigger — verify these broker GTT orders before executing.")
+
+    # ---- incubation rows in CSV export ------------------------------------
+    for _tk in sorted(inc_entries):
+        _e = inc_entries[_tk]
+        csv_rows.append({
+            "Stock Ticker": _tk,
+            "Stage": "Incubating",
+            "Action": "BUY",
+            "Lane / Signal": f"{_e['tier']} - {_e['reason']}",
+            "SIP Amount (Rs)": round(float(_e["starter_sip"]), 2),
+            "Est. Shares": 0,
+            "Updated GTT Trigger (Rs)": 0.0,
+            "GTT Anchor Type": "Incubation 40% Catastrophe Floor",
+        })
+
+    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8")
+    st.download_button("Download Monthly Order & GTT Sheet (CSV)", data=csv_bytes,
+                       file_name="monthly_sip_gtt_plan.csv", mime="text/csv", key="s4c_csv")
+
+
 def render(ctx: AppContext) -> None:
     f = ctx.filters
     st.markdown("### Direct Equity")
@@ -1163,6 +1795,10 @@ def render(ctx: AppContext) -> None:
         _render_stock_attribution(ctx)
         st.divider()
         _render_whatif_simulator(ctx)
+        st.divider()
+        _render_stage4_action_center(ctx)
+        st.divider()
+        _render_stage4_planner(ctx)
         st.divider()
         _render_sector_breakdowns(ctx)
         st.divider()

@@ -44,12 +44,44 @@ HARD_STOP_MIN_INVESTED = 150000.0
 HARD_STOP_AER_FLOOR = 0.50
 
 TREND_BREAK_AER = 1.30
-TREND_BREAK_DMA_BUFFER = 0.97
+TREND_BREAK_DMA_BUFFER = 0.95          # 5% below 50-DMA (monthly check-in, fewer false alarms)
+SIP_OVEREXTENDED_DMA_BUFFER = 0.97     # SIP 0.5x rule keeps the original 97% threshold
 
-TRIM_AER = 1.50
+TRIM_AER = 1.85
 TRIM_MIN_MARKET_VALUE = 200000.0
 TRIM_MIN_XIRR = 0.25
-TRIM_TARGET_MULT = 1.25
+TRIM_TARGET_MULT = 1.40
+
+INCUBATION_MAX_INVESTED = 100000.0     # below this => incubating
+INCUBATION_MAX_DAYS = 180              # or under 180 days since first buy => incubating
+INCUBATION_GTT_MULT = 0.60             # incubation GTT = 40% catastrophe circuit breaker
+GTT_BUFFER_WARN = 0.10                 # warn when within 10% of GTT trigger
+
+MAX_SINGLE_STOCK_WEIGHT_PCT = 0.08     # over-allocated freeze target (8% market weight)
+SIP_GRANULARITY = 5000.0               # round all SIPs to exact multiples of Rs 5,000
+TRAILING_PEAK_MULT = 2.00              # activate trailing peak floor only after a +100% (2.0x) rally
+TRAILING_STOP_MULT = 1.50              # trailing stop width = 1.50 x annual vol
+TRAILING_STOP_FLOOR = 0.35             # clamp lower bound for trailing stop %
+TRAILING_STOP_CAP = 0.45               # clamp upper bound for trailing stop %
+
+# Monthly-SIP rule thresholds, keyed off dma200_distance_pct = (CMP - 200-DMA) / 200-DMA
+SIP_RUN_UP_DMA_DISTANCE = 0.30         # > +30% above 200-DMA => Lane 3 0.0x run-up freeze (hold winners)
+SIP_PULLBACK_DMA_DISTANCE_MAX = 0.15   # Lane 1 2.0x only while 0% <= distance <= +15%
+SIP_PULLBACK_AER_MAX = 1.30            # Lane 1 2.5x requires AER < 1.30
+SIP_LANE1_MULT = 2.50                  # Lane 1 double-down SIP multiplier
+SIP_PULLBACK_WINNER_MARGIN = 0.10      # 2.0x requires XIRR > benchmark + 10%
+SIP_BROKEN_TREND_AER = 0.85            # AER < 0.85 => Lane 4 broken-trend 0.0x warning
+SIP_OVERALLOC_AER = 1.35               # AER >= 1.35 => Lane 3 over-allocation freeze (replaces fixed 8% cap)
+MAX_SINGLE_STOCK_SIP = 35000.0         # per-stock monthly SIP cap (Rs, in 5k multiples)
+
+# Smart New-Stock Incubation Pacing (invested_cost < INCUBATION_MAX_INVESTED)
+INCUBATION_TIER_A_SIP = 20000.0        # fast-track starter: low vol + golden cross + ideal pullback
+INCUBATION_TIER_B_SIP = 10000.0        # standard incubation pace
+INCUBATION_TIER_C_SIP = 5000.0         # toe-hold / overheated / trend-not-confirmed guard
+INCUBATION_GRADUATION_TARGET = 100000.0  # invested_cost at which incubation graduates
+SIP_TIER_A_MAX_VOL = 0.28              # Tier A requires annual_volatility < 28%
+
+DEFAULT_MONTHLY_SIP_BUDGET = 300000.0  # default total monthly SIP budget (Rs)
 
 LAGGARD_MIN_DAYS = 365
 
@@ -79,6 +111,7 @@ class StockInput:
     xirr: float | None = None
     holding_start_date: date | None = None
     price_series: list[float] = field(default_factory=list)
+    price_dates: list = field(default_factory=list)
 
     @property
     def cmp(self) -> float | None:
@@ -174,23 +207,63 @@ def _annualized_volatility(returns) -> float | None:
     return statistics.stdev(clean) * math.sqrt(TRADING_DAYS_PER_YEAR)
 
 
-def _dynamic_stop_loss_pct(annual_vol: float | None) -> float | None:
-    """1.5 x volatility clamped to a [20%, 45%] band."""
+def _dynamic_stop_loss_pct(annual_vol: float | None,
+                           multiplier: float = STOP_LOSS_MULT) -> float | None:
+    """``multiplier × volatility`` clamped to a [20%, 45%] band."""
     if annual_vol is None:
         return None
-    return min(STOP_LOSS_CAP, max(STOP_LOSS_FLOOR, STOP_LOSS_MULT * annual_vol))
+    return min(STOP_LOSS_CAP, max(STOP_LOSS_FLOOR, multiplier * annual_vol))
 
 
 # --------------------------------------------------------------------------- #
 # Core per-stock metric function
 # --------------------------------------------------------------------------- #
+def _incubation(stock: StockInput, as_of_date=None) -> bool:
+    """True while a position is still in Incubation Mode (small OR young)."""
+    if stock.invested_cost is not None and stock.invested_cost < INCUBATION_MAX_INVESTED:
+        return True
+    if as_of_date is not None and stock.holding_start_date is not None:
+        try:
+            days = (_to_date(as_of_date) - _to_date(stock.holding_start_date)).days
+        except (TypeError, ValueError):
+            return False
+        if days < INCUBATION_MAX_DAYS:
+            return True
+    return False
+
+
+def _peak_price_52w(price_series, price_dates, holding_start_date):
+    """Highest Adjusted Close over the trailing 252 trading days on/after
+    ``holding_start_date`` (falls back to the last 252 prices when dates absent)."""
+    if not price_series:
+        return None
+    window = list(price_series[-VOL_WINDOW:])
+    dates_window = list(price_dates[-VOL_WINDOW:]) if price_dates else []
+    if dates_window and holding_start_date is not None and len(dates_window) == len(window):
+        try:
+            hsd = _to_date(holding_start_date)
+            filtered = [p for d, p in zip(dates_window, window) if _to_date(d) >= hsd]
+            if filtered:
+                window = filtered
+        except (TypeError, ValueError):
+            pass
+    return max(window) if window else None
+
+
 def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
-                        benchmarkXIRR: float | None) -> dict:
+                        benchmarkXIRR: float | None,
+                        stop_loss_mult: float = STOP_LOSS_MULT,
+                        as_of_date=None) -> dict:
     """Compute the full metric bundle for one stock.
 
     Returns a dict with the 50/200-DMA, annualised volatility, dynamic
-    stop-loss %, cost / market weight, AER and Efficiency Score plus a few
-    bookkeeping fields (``trading_days`` and ``insufficient_data``).
+    stop-loss %, cost / market weight, AER and Efficiency Score, plus GTT
+    protection fields (``incubation``, ``gtt_stop_loss_price``,
+    ``gtt_buffer_pct``) and bookkeeping fields.
+
+    ``stop_loss_mult`` overrides the volatility-to-stop-loss multiplier (Stage
+    4B live control bar; defaults to :data:`STOP_LOSS_MULT`). ``as_of_date``
+    enables the incubation-day count; when omitted only ``invested_cost`` is used.
     """
     series = [float(x) for x in (stock.price_series or []) if x is not None]
     n = len(series)
@@ -200,7 +273,11 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
 
     returns_window = series[-(VOL_WINDOW + 1):]
     annual_vol = _annualized_volatility(_daily_log_returns(returns_window))
-    stop_loss = _dynamic_stop_loss_pct(annual_vol)
+    stop_loss = _dynamic_stop_loss_pct(annual_vol, stop_loss_mult)
+
+    dma200_distance = None
+    if dma_long is not None and dma_long > 0 and stock.cmp is not None:
+        dma200_distance = (float(stock.cmp) - float(dma_long)) / float(dma_long)
 
     cost_weight = _safe_div(stock.invested_cost, portfolioTotals.total_invested_cost)
     market_weight = _safe_div(stock.market_value, portfolioTotals.total_market_value)
@@ -209,18 +286,57 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
     if stock.xirr is not None and benchmarkXIRR is not None and aer is not None:
         efficiency = (float(stock.xirr) - float(benchmarkXIRR)) * aer
 
+    # GTT protection: catastrophe breaker while incubating; cost-or-trailing-peak once graduated.
+    incubation = _incubation(stock, as_of_date)
+    cmp = stock.cmp
+    gtt_price = None
+    gtt_anchor_type = None
+    gtt_anchor_price = None
+    if stock.avg_buy_price and stock.avg_buy_price > 0:
+        if incubation:
+            gtt_price = stock.avg_buy_price * INCUBATION_GTT_MULT
+            gtt_anchor_type = "Catastrophe Floor (40%)"
+            gtt_anchor_price = stock.avg_buy_price
+        else:
+            # Default annual_volatility = 0.25 when price history is insufficient
+            # (< 252 trading days) so GTT is never left unset and never falls to 0.50 x cost.
+            _vol = annual_vol if (annual_vol is not None and n >= VOL_WINDOW) else 0.25
+            stop_loss = _dynamic_stop_loss_pct(_vol, stop_loss_mult)
+            cost_floor = stock.avg_buy_price * (1.0 - stop_loss)
+            peak = _peak_price_52w(series, stock.price_dates, stock.holding_start_date)
+            trailing_floor = 0.0
+            if peak is not None and peak >= stock.avg_buy_price * TRAILING_PEAK_MULT:
+                trailing_stop = min(TRAILING_STOP_CAP,
+                                    max(TRAILING_STOP_FLOOR, TRAILING_STOP_MULT * _vol))
+                trailing_floor = peak * (1.0 - trailing_stop)
+            if trailing_floor > cost_floor:
+                gtt_price = trailing_floor
+                gtt_anchor_type = "Trailing Peak Floor"
+                gtt_anchor_price = peak
+            else:
+                gtt_price = cost_floor
+                gtt_anchor_type = "Cost Floor"
+                gtt_anchor_price = stock.avg_buy_price
+    gtt_buffer = ((cmp - gtt_price) / cmp) if (cmp and cmp > 0 and gtt_price is not None) else None
+
     return {
         "security_id": stock.security_id,
         "symbol": stock.symbol or stock.security_id,
-        "cmp": stock.cmp,
+        "cmp": cmp,
         "dma_50": dma_short,
         "dma_200": dma_long,
+        "dma200_distance_pct": dma200_distance,
         "annual_volatility": annual_vol,
         "dynamic_stop_loss_pct": stop_loss,
         "cost_weight_pct": cost_weight,
         "market_weight_pct": market_weight,
         "aer": aer,
         "efficiency_score": efficiency,
+        "incubation": incubation,
+        "gtt_stop_loss_price": gtt_price,
+        "gtt_buffer_pct": gtt_buffer,
+        "gtt_anchor_type": gtt_anchor_type,
+        "gtt_anchor_price": gtt_anchor_price,
         "trading_days": n,
         "insufficient_data": n < MIN_TRADING_DAYS,
     }
@@ -239,8 +355,13 @@ def _held_days(stock: StockInput, as_of_date) -> int | None:
 
 
 def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: PortfolioTotals,
-                    as_of_date=None) -> SignalResult:
-    """Apply the four signal rules in strict priority order for one stock."""
+                    as_of_date=None, trim_aer: float = TRIM_AER,
+                    min_market_value: float = TRIM_MIN_MARKET_VALUE) -> SignalResult:
+    """Apply the four signal rules in strict priority order for one stock.
+
+    ``trim_aer`` and ``min_market_value`` override the CONCENTRATION_TRIM
+    thresholds (Stage 4B live control bar); defaults keep Stage 4A behaviour.
+    """
     cmp = metrics.get("cmp")
     aer = metrics.get("aer")
     dma_short = metrics.get("dma_50")
@@ -278,8 +399,8 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
                        reason="TREND_BREAK_LOCK: AER>=1.30 and price broke below 50-DMA")
 
     # Priority 3 -- CONCENTRATION_TRIM ----------------------------------------
-    if (aer is not None and aer >= TRIM_AER
-            and stock.market_value is not None and stock.market_value >= TRIM_MIN_MARKET_VALUE
+    if (aer is not None and aer >= trim_aer
+            and stock.market_value is not None and stock.market_value >= min_market_value
             and stock.xirr is not None and stock.xirr > TRIM_MIN_XIRR):
         target = None
         shares = None
@@ -290,7 +411,7 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
             shares = math.floor(target / cmp) if target is not None and target > 0 else 0
         return _result(CONCENTRATION_TRIM, 3, "TRIM_TO_1.25X_COST_WEIGHT", 0.0,
                        target=target, shares=shares,
-                       reason="CONCENTRATION_TRIM: AER>=1.50, big winner, overweight")
+                       reason="CONCENTRATION_TRIM: AER>=" + f"{trim_aer:.2f}" + ", big winner, overweight")
 
     # Priority 4 -- LAGGARD_EXIT ----------------------------------------------
     held = _held_days(stock, as_of_date)
@@ -307,50 +428,132 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
 # Monthly SIP multiplier
 # --------------------------------------------------------------------------- #
 def compute_sip_multiplier(stock: StockInput, metrics: dict, benchmarkXIRR: float | None,
-                           frozen: bool = False) -> float:
-    """Return the monthly SIP multiplier (0.0 / 0.5 / 1.0 / 2.0)."""
+                           frozen: bool = False,
+                           max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT) -> float:
+    """Return the monthly SIP multiplier (0.0 / 1.0 / 2.0) for a graduated stock.
+
+    Four-lane ladder keyed off dma200_distance_pct = (CMP - 200-DMA) / 200-DMA:
+    - Lane 3 (0.0x) Run-Up / Over-Allocated Freeze: distance > +30% OR AER >= 1.35
+      (let winners run; warning_level stays False).
+    - Lane 4 (0.0x) Broken Trend: CMP < 200-DMA OR AER < 0.85 (warning_level True).
+    - Lane 1 (2.0x) Resting Winner: XIRR > benchmark + 10% AND 0% <= distance <= 15%
+      AND AER < 1.25.
+    - Lane 2 (1.0x) Cruising Stock: 0% <= distance <= 30% AND 0.85 <= AER < 1.35.
+    Incubating stocks are locked at 1.0x by :func:`evaluate_signals` (not here).
+    """
     if frozen:
         return 0.0
     cmp = metrics.get("cmp")
     aer = metrics.get("aer")
-    dma_short = metrics.get("dma_50")
     dma_long = metrics.get("dma_200")
     xirr = stock.xirr
-    if cmp is None or dma_long is None or aer is None:
+    if cmp is None or dma_long is None or aer is None or dma_long <= 0:
         return 0.0
+    dma200_distance = (float(cmp) - float(dma_long)) / float(dma_long)
 
-    # 2.0x -- Press Winners
-    if (xirr is not None and benchmarkXIRR is not None and xirr > benchmarkXIRR + 0.10
-            and cmp > dma_long and 1.05 <= aer < 1.40):
-        return 2.0
-    # 1.0x -- Core Accumulate
-    if cmp > dma_long and 0.85 <= aer < 1.25:
+    # Lane 3 -- Run-Up / Over-Allocated Freeze (dma200 > +30% OR AER >= 1.35)
+    if dma200_distance > SIP_RUN_UP_DMA_DISTANCE or aer >= SIP_OVERALLOC_AER:
+        return 0.0
+    # 0.0x -- Broken Trend (Warning Level): below 200-DMA or AER collapsed
+    if dma200_distance < 0.0 or aer < SIP_BROKEN_TREND_AER:
+        return 0.0
+    # 2.0x -- Pullback-in-Uptrend Winner (proven winner consolidating near 200-DMA)
+    if (xirr is not None and benchmarkXIRR is not None
+            and xirr > benchmarkXIRR + SIP_PULLBACK_WINNER_MARGIN
+            and 0.0 <= dma200_distance <= SIP_PULLBACK_DMA_DISTANCE_MAX
+            and aer < SIP_PULLBACK_AER_MAX):
+        return 2.5
+    # 1.0x -- Steady Uptrend Accumulation
+    if (0.0 <= dma200_distance <= SIP_RUN_UP_DMA_DISTANCE
+            and SIP_BROKEN_TREND_AER <= aer < SIP_OVERALLOC_AER):
         return 1.0
-    # 0.5x -- Overextended Caution
-    if aer >= 1.25 and dma_short is not None and cmp >= dma_short * TREND_BREAK_DMA_BUFFER:
-        return 0.5
-    # 0.0x -- Trend Freeze (cmp < 200-DMA or AER < 0.85, plus any residual gap)
     return 0.0
 
+
+
+def incubation_starter_sip(metrics: dict) -> dict:
+    # Starter monthly SIP for an incubating (< Rs 1,00,000) stock: Tier A/B/C.
+    dma_short = metrics.get("dma_50")
+    dma_long = metrics.get("dma_200")
+    annual_vol = metrics.get("annual_volatility")
+    dma200_dist = metrics.get("dma200_distance_pct")
+    golden_cross = bool(dma_short is not None and dma_long is not None and dma_long > 0 and dma_short > dma_long)
+    if dma200_dist is None:
+        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Insufficient price history - toe-hold Rs 5k"}
+    if dma200_dist < 0.0:
+        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Below 200-DMA - trend not confirmed Rs 5k"}
+    if dma200_dist > SIP_RUN_UP_DMA_DISTANCE:
+        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Overheated >30% above 200-DMA - toe-hold Rs 5k"}
+    if (annual_vol is not None and annual_vol < SIP_TIER_A_MAX_VOL and golden_cross
+            and dma200_dist <= SIP_PULLBACK_DMA_DISTANCE_MAX):
+        return {"sip": INCUBATION_TIER_A_SIP, "tier": "A", "is_golden_cross": golden_cross, "reason": "Ideal 200-DMA pullback + golden cross - fast-track Rs 20k"}
+    return {"sip": INCUBATION_TIER_B_SIP, "tier": "B", "is_golden_cross": golden_cross, "reason": "Standard incubation pace Rs 10k"}
+
+
+def months_to_graduate(invested_cost, starter_sip) -> int | None:
+    # Months to reach the Rs 1,00,000 graduation mark at the given monthly pace.
+    try:
+        sip = float(starter_sip)
+    except (TypeError, ValueError):
+        return None
+    if sip <= 0:
+        return None
+    gap = max(0.0, INCUBATION_GRADUATION_TARGET - float(invested_cost or 0.0))
+    return int(math.ceil(gap / sip))
 
 
 # --------------------------------------------------------------------------- #
 # Orchestrator: metrics + signals + SIP multipliers for a whole portfolio
 # --------------------------------------------------------------------------- #
 def evaluate_signals(stocks, portfolioTotals: PortfolioTotals,
-                     benchmarkXIRR: float | None, as_of_date=None) -> list[dict]:
+                     benchmarkXIRR: float | None, as_of_date=None,
+                     trim_aer: float = TRIM_AER, stop_loss_mult: float = STOP_LOSS_MULT,
+                     min_market_value: float = TRIM_MIN_MARKET_VALUE,
+                     max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT) -> list[dict]:
     """Evaluate every stock and return enriched, priority-annotated rows."""
     rows: list[dict] = []
     for stock in stocks or []:
-        metrics = analyzeStockSignals(stock, portfolioTotals, benchmarkXIRR)
-        sig = evaluate_signal(stock, metrics, portfolioTotals, as_of_date)
+        metrics = analyzeStockSignals(stock, portfolioTotals, benchmarkXIRR,
+                                      stop_loss_mult=stop_loss_mult, as_of_date=as_of_date)
+        sig = evaluate_signal(stock, metrics, portfolioTotals, as_of_date,
+                              trim_aer=trim_aer, min_market_value=min_market_value)
         frozen = sig.signal_type in FROZEN_SIGNALS
-        sig.sip_multiplier = compute_sip_multiplier(stock, metrics, benchmarkXIRR, frozen=frozen)
+        sip = compute_sip_multiplier(stock, metrics, benchmarkXIRR, frozen=frozen,
+                                     max_stock_weight_pct=max_stock_weight_pct)
+        # Incubating positions are locked at 1.0x regardless of technicals.
+        if metrics.get("incubation"):
+            sip = 1.0
+        # LAGGARD_EXIT is a deliberate exit: pause SIP and never a warning.
+        is_laggard_exit = sig.signal_type == LAGGARD_EXIT
+        if is_laggard_exit:
+            sip = 0.0
+        sig.sip_multiplier = sip
         row = sig.as_dict()
         row["holding_start_date"] = (
             str(stock.holding_start_date) if stock.holding_start_date else None
         )
         row["is_bottom_laggard"] = False
+        # Warning Level: graduated, not hard-stopped, NOT a run-up / over-allocated
+        # hold-winners pause, and either frozen at 0.0x (broken trend) OR within
+        # GTT_BUFFER_WARN of the GTT stop. HARD_STOP_LOSS, the 0.0x Run-Up Freeze
+        # (dma200_distance > +30%) and the Over-Allocated Freeze (AER >= 1.35) all
+        # keep warning_level False.
+        buf = row.get("gtt_buffer_pct")
+        is_hard_stop = sig.signal_type == HARD_STOP_LOSS
+        aer_m = metrics.get("aer")
+        dma_dist = metrics.get("dma200_distance_pct")
+        run_up = dma_dist is not None and dma_dist > SIP_RUN_UP_DMA_DISTANCE
+        over_allocated = (aer_m is not None and aer_m >= SIP_OVERALLOC_AER)
+        row["run_up_freeze"] = bool((not metrics.get("incubation")) and run_up)
+        row["over_allocated"] = bool((not metrics.get("incubation")) and over_allocated)
+        pause_hold = row["run_up_freeze"] or row["over_allocated"]
+        row["warning_level"] = bool(
+            (not is_hard_stop)
+            and (not is_laggard_exit)
+            and (not metrics.get("incubation"))
+            and (not pause_hold)
+            and ((sip == 0.0) or (buf is not None and buf <= GTT_BUFFER_WARN))
+        )
         rows.append(row)
 
     # Flag the Bottom-5 laggards by Efficiency Score (ascending).
@@ -366,6 +569,110 @@ def rank_bottom_laggards(rows, n: int = 5) -> list[dict]:
         key=lambda r: r["efficiency_score"],
     )
     return ranked[:n]
+
+
+def compute_monthly_sip_allocation(rows, total_monthly_budget,
+                                   harvested_cash: float = 0.0,
+                                   granularity: float = SIP_GRANULARITY,
+                                   max_single_stock_sip: float | None = None) -> dict:
+    # Exact-multiple SIP distribution. Base budget spreads across all eligible
+    # holdings; harvested exit/trim cash is routed into Lane 1 (2x+) winners up to
+    # their per-stock cap, with any excess parked as Dry Powder.
+    rows = list(rows or [])
+    budget_raw = float(total_monthly_budget or 0.0)
+    harvest_raw = float(harvested_cash or 0.0)
+    total_raw = budget_raw + harvest_raw
+    if granularity and granularity > 0:
+        deployable = math.floor(total_raw / granularity) * granularity
+        base_budget = math.floor(budget_raw / granularity) * granularity
+    else:
+        deployable = total_raw
+        base_budget = budget_raw
+    carry_forward = total_raw - deployable
+
+    total_units = sum(float(r.get("sip_multiplier") or 0.0) for r in rows
+                      if float(r.get("sip_multiplier") or 0.0) > 0)
+
+    mults: list[float] = []
+    floored: list[float] = []
+    remainders: list[float] = []
+    for r in rows:
+        mult = float(r.get("sip_multiplier") or 0.0)
+        if total_units > 0 and mult > 0:
+            raw = mult / total_units * base_budget
+        else:
+            raw = 0.0
+        if granularity and granularity > 0:
+            fl = math.floor(raw / granularity) * granularity
+        else:
+            fl = raw
+        mults.append(mult)
+        floored.append(fl)
+        remainders.append(raw - fl)
+
+    if max_single_stock_sip is not None and granularity and granularity > 0:
+        cap = math.floor(max_single_stock_sip / granularity) * granularity
+    else:
+        cap = float("inf")
+    for i in range(len(rows)):
+        if floored[i] > cap:
+            floored[i] = cap
+
+    # Phase 1 -- spread leftover BASE budget by largest remainder, up to cap.
+    remaining = base_budget - sum(floored)
+    chunks = round(remaining / granularity) if granularity and granularity > 0 else 0
+    eligible_idx = [i for i, m in enumerate(mults) if m > 0]
+    order = sorted(eligible_idx, key=lambda i: (-remainders[i], -mults[i]))
+    chunks = max(0, int(chunks))
+    while chunks > 0 and order:
+        progressed = False
+        for idx in order:
+            if chunks <= 0:
+                break
+            if floored[idx] + granularity <= cap:
+                floored[idx] += granularity
+                chunks -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    # Phase 2 -- route harvested cash into active Lane 1 (2x+) winners up to cap.
+    if granularity and granularity > 0:
+        harvest_chunks = max(0, int(round((deployable - base_budget) / granularity)))
+    else:
+        harvest_chunks = 0
+    lane1_idx = [i for i, m in enumerate(mults) if m >= SIP_LANE1_MULT - 1e-9]
+    while harvest_chunks > 0 and lane1_idx:
+        progressed = False
+        for idx in lane1_idx:
+            if harvest_chunks <= 0:
+                break
+            if floored[idx] + granularity <= cap:
+                floored[idx] += granularity
+                harvest_chunks -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    total_allocated = sum(floored)
+    parked_cash = deployable - total_allocated
+
+    out = []
+    for i, r in enumerate(rows):
+        enriched = dict(r)
+        enriched["recommended_sip_rupees"] = floored[i]
+        cmp_ = r.get("cmp") or 0.0
+        enriched["est_shares"] = math.floor(floored[i] / cmp_) if cmp_ and cmp_ > 0 else 0
+        out.append(enriched)
+    return {
+        "rows": out,
+        "deployable_budget": deployable,
+        "total_allocated": total_allocated,
+        "parked_cash": parked_cash,
+        "total_multiplier_units": total_units,
+        "all_frozen": total_units <= 0,
+        "carry_forward_cash": carry_forward,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -470,6 +777,118 @@ def _fifo_position(transactions, security_id, as_of_date, opening_positions=None
     return qty, cost, avg, episode_start
 
 
+# --------------------------------------------------------------------------- #
+# FIFO lot-level detail + India-equity tax preview (LTCG / STCG)
+# --------------------------------------------------------------------------- #
+def fifo_lots(transactions, security_id, as_of_date, opening_positions=None):
+    """Open FIFO lots for the currently-held shares.
+
+    Returns ``[{"qty", "unit_price", "buy_date"}]`` oldest-first, so callers can
+    inspect holding periods (used for the tax preview).
+    """
+    sid = str(security_id).strip().upper()
+    cutoff = _to_date(as_of_date)
+    events = []
+
+    for op in opening_positions or []:
+        try:
+            od = _to_date(
+                op.get("ledger_opening_date") if isinstance(op, dict) else op.ledger_opening_date
+            )
+        except (TypeError, ValueError):
+            continue
+        if od > cutoff:
+            continue
+        opis = str(
+            (op.get("security_id") if isinstance(op, dict) else op.security_id) or ""
+        ).strip().upper()
+        if opis != sid:
+            continue
+        oq = float((op.get("opening_qty") if isinstance(op, dict) else op.opening_qty) or 0.0)
+        events.append((od, "BUY", oq, 0.0))
+
+    for t in transactions or []:
+        if _tx_isin(t) != sid:
+            continue
+        try:
+            dd = _to_date(_tx_date(t))
+        except (TypeError, ValueError):
+            continue
+        if dd > cutoff:
+            continue
+        side = _tx_side(t)
+        if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+            events.append((dd, "BUY", _tx_qty(t), _tx_amount(t)))
+        elif side == "SELL":
+            events.append((dd, "SELL", _tx_qty(t), 0.0))
+
+    events.sort(key=lambda x: (x[0], x[1]))
+    lots: list[list] = []  # [qty, unit_price, buy_date]
+    for dd, kind, q, amt in events:
+        if kind == "BUY":
+            unit = (amt / q) if q > 0 and amt else 0.0
+            lots.append([q, unit, dd])
+        else:
+            remaining = q
+            while remaining > 1e-9 and lots:
+                take = min(lots[0][0], remaining)
+                lots[0][0] -= take
+                remaining -= take
+                if lots[0][0] <= 1e-9:
+                    lots.pop(0)
+    return [{"qty": l[0], "unit_price": l[1], "buy_date": l[2]} for l in lots if l[0] > 1e-9]
+
+
+def fifo_tax_preview(transactions, security_id, shares_to_sell, sale_price, as_of_date,
+                     opening_positions=None, ltcg_rate=0.125, stcg_rate=0.20,
+                     ltcg_exemption=125000.0, ltcg_min_days=365):
+    """FIFO tax preview for selling ``shares_to_sell`` at ``sale_price``.
+
+    India equity rules: lots held > 365 days are **LTCG** (12.5% above a
+    ₹1.25L annual exemption); lots held ≤ 365 days are **STCG** (20%). Returns
+    per-bucket shares, realized gain, estimated tax and net post-tax cash. The
+    ₹1.25L exemption is annual/portfolio-wide; applied here per-stock as an
+    illustration.
+    """
+    ads = _to_date(as_of_date)
+    lots = fifo_lots(transactions, security_id, ads, opening_positions)
+    want = max(0.0, float(shares_to_sell or 0.0))
+    price = float(sale_price or 0.0)
+
+    ltcg_sh = stcg_sh = 0.0
+    ltcg_gain = stcg_gain = 0.0
+    remaining = want
+    for lot in lots:
+        if remaining <= 1e-9:
+            break
+        take = min(lot["qty"], remaining)
+        remaining -= take
+        gain = (price - lot["unit_price"]) * take
+        held_days = (ads - lot["buy_date"]).days
+        if held_days > ltcg_min_days:
+            ltcg_sh += take
+            ltcg_gain += gain
+        else:
+            stcg_sh += take
+            stcg_gain += gain
+
+    ltcg_tax = max(0.0, ltcg_gain - ltcg_exemption) * ltcg_rate
+    stcg_tax = max(0.0, stcg_gain) * stcg_rate
+    total_tax = ltcg_tax + stcg_tax
+    gross = want * price
+    return {
+        "shares_sold": want,
+        "sale_price": price,
+        "ltcg_shares": ltcg_sh,
+        "stcg_shares": stcg_sh,
+        "ltcg_gain": ltcg_gain,
+        "stcg_gain": stcg_gain,
+        "realized_gain": ltcg_gain + stcg_gain,
+        "estimated_tax": total_tax,
+        "gross_proceeds": gross,
+        "net_cash_unlocked": gross - total_tax,
+    }
+
 
 # --------------------------------------------------------------------------- #
 # Adjusted Close series + StockInput construction from raw transactions
@@ -491,6 +910,25 @@ def _default_adjusted_close_series(security_id, as_of_date, db_path=None) -> lis
     except sqlite3.Error:
         return []
     return [float(r[0]) for r in rows if r[0] is not None]
+
+
+def _default_adjusted_close_pairs(security_id, as_of_date, db_path=None):
+    """Ascending ``(trade_date, adjusted_close)`` pairs (``<= as_of_date``)."""
+    db = (db_path or os.environ.get("ICICI_MARKET_DB")
+          or os.environ.get("DEFAULT_MARKET_DB") or "data/market_data.sqlite3")
+    sid = str(security_id).strip().upper()
+    cutoff = str(_to_date(as_of_date))[:10]
+    try:
+        con = sqlite3.connect(db)
+        rows = con.execute(
+            "SELECT trade_date, COALESCE(adjusted_close, close_price) FROM stock_prices "
+            "WHERE UPPER(security_id)=? AND trade_date<=? ORDER BY trade_date",
+            (sid, cutoff),
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return []
+    return [(str(r[0])[:10], float(r[1])) for r in rows if r[1] is not None]
 
 
 def make_adjusted_close_lookup(db_path=None):
@@ -532,6 +970,15 @@ def build_stock_input(transactions, price_lookup, as_of_date, security_id,
             series = _default_adjusted_close_series(sid, ad)
     series = [float(x) for x in (series or []) if x is not None]
 
+    price_dates = []
+    if series:
+        try:
+            pairs = _default_adjusted_close_pairs(sid, ad)
+            if len(pairs) == len(series):
+                price_dates = [d for d, _ in pairs]
+        except Exception:  # noqa: BLE001
+            price_dates = []
+
     cmp = series[-1] if series else None
     if cmp is None and callable(price_lookup):
         try:
@@ -568,6 +1015,7 @@ def build_stock_input(transactions, price_lookup, as_of_date, security_id,
         xirr=xirr,
         holding_start_date=episode_start,
         price_series=series,
+        price_dates=price_dates,
     )
 
 
