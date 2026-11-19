@@ -534,6 +534,136 @@ def evaluate_signals(stocks, portfolioTotals: PortfolioTotals,
                      max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT,
                      excluded_tickers: set[str] = None) -> list[dict]:
     """Evaluate every stock and return enriched, priority-annotated rows."""
+
+# ---------------------------------------------------------------------------
+# Watchlist helpers
+# ---------------------------------------------------------------------------
+
+def resolve_watchlist_security(query: str, symbol_map=None):
+    """Resolve a watchlist query to ISIN / Ticker / Company Name.
+
+    Returns dict:
+        {"isin": str or None,
+         "ticker": str or None,
+         "company_name": str or None,
+         "resolved": bool}
+    """
+    q = str(query or "").strip().upper()
+    if not q:
+        return {"isin": None, "ticker": None, "company_name": "", "resolved": False}
+
+    # Direct ISIN (12 chars starting with IN/INF)
+    if (q.startswith("IN") and len(q) == 12) or q.startswith("INF"):
+        isin = q
+        resolved = True
+    else:
+        sm = symbol_map or {}
+        for cand in (q, q + ".NS", q + ".BO"):
+            if cand in sm:
+                isin = sm[cand]
+                resolved = True
+                break
+        else:
+            core = q.split(".")[0] if "." in q else q
+            for sym, isin_val in sm.items():
+                if sym.split(".")[0] == core:
+                    isin = isin_val
+                    resolved = True
+                    break
+            else:
+                isin = None
+                resolved = False
+
+    # Fallback via yfinance search
+    if not resolved:
+        try:
+            import market_data.providers as p
+            yf_mod = getattr(p, "yfinance", None)
+            if yf_mod is not None:
+                ticker_obj = yf_mod.Ticker(q)
+                info = getattr(ticker_obj, "info", None)
+                if info and (info.get("shortName") or info.get("symbol")):
+                    isin = info.get("shortName") or info.get("symbol")
+                    ticker = info.get("symbol") or ""
+                    resolved = True
+                elif info and info.get("exchange"):
+                    isin = f"{q}.{info['exchange']}"
+                    ticker = info.get("symbol") or ""
+                    resolved = True
+        except Exception:
+            pass
+
+    from app.shared import security_name
+    company_name = security_name(isin, txs=None, holdings=None)
+
+    return {
+        "isin": isin or "",
+        "ticker": ticker or "",
+        "company_name": company_name or "",
+        "resolved": resolved,
+    }
+
+
+def build_watchlist_stock_input(entry: dict, as_of_date=None) -> s4.StockInput:
+    sid = (
+        entry.get("isin") or entry.get("ticker") or entry.get("security_id") or ""
+    ).strip().upper() or ""
+    quantity = float(entry.get("invested", 0.0))
+    avg_buy_price = float(entry.get("avg_buy_price", 100.0))
+    invested = quantity
+    mv = quantity * avg_buy_price if quantity > 0 else (quantity if avg_buy_price else 0.0)
+    xirr = float(entry.get("xirr", 0.20)) if entry.get("xirr") is not None else 0.20
+    holding_start_date = as_of_date or date(2026, 1, 1)
+    price_series = []
+    manual_cmp = entry.get("manual_cmp")
+    if entry.get("imported_prices"):
+        price_series = sorted(entry["imported_prices"], key=lambda row: row[0])[:200]
+    elif manual_cmp is not None:
+        price_series = [[as_of_date, float(manual_cmp)]]
+    else:
+        price_series = []
+    return s4.StockInput(
+        security_id=sid,
+        symbol=sid,
+        quantity=quantity,
+        avg_buy_price=avg_buy_price,
+        invested_cost=invested,
+        market_value=mv,
+        xirr=xirr,
+        holding_start_date=holding_start_date,
+        price_series=price_series,
+        price_dates=[str(d) for d, _ in price_series],
+    )
+
+
+def import_watchlist_price_history(sid, csv_bytes):
+    if not csv_bytes:
+        return {"prices": [], "days": 0, "missing": True}
+    try:
+        text = csv_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        text = csv_bytes.decode("latin-1").strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() != ""]
+    if not lines:
+        return {"prices": [], "days": 0, "missing": True}
+    dates = []
+    prices = []
+    for ln in lines:
+        parts = [p.strip() for p in ln.split(",")]
+        if len(parts) >= 2:
+            dates.append(str(parts[0]))
+            prices.append(float(parts[1]))
+    if dates:
+        dates.sort()
+        prices = [float(p) for _, p in zip(dates, prices)]
+        n_days = len(dates)
+        missing = n_days < MIN_PRICE_HISTORY_DAY if n_days else True
+        return {"prices": list(zip(dates, prices)), "days": n_days, "missing": missing}
+    return {"prices": [], "days": 0, "missing": True}
+
+
+def compute_fixed_budget_sip_allocation(active_rows, watchlist_entries, total_deployable_budget=300000.0, max_single_stock_sip=35000.0, granularity=5000.0):
+    raise NotImplementedError("Placeholder — full budget allocation logic needed.")
     rows: list[dict] = []
     for stock in stocks or []:
         metrics = analyzeStockSignals(stock, portfolioTotals, benchmarkXIRR,
