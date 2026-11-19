@@ -16,7 +16,7 @@ def _stock(sid="STK", *, series=None, invested=100000.0, avg=100.0, xirr=0.20,
     return s4.StockInput(
         security_id=sid, symbol=sid,
         quantity=qty if qty is not None else (invested / avg if avg else 0.0),
-        avg_buy_price=avg, invested_cost=invested, market_value=mv,
+        avg_buy_price=avg, invested=invested, market_value=mv,
         xirr=xirr, holding_start_date=start, price_series=series,
     )
 
@@ -42,7 +42,7 @@ GTT_FLOOR_MIN_PCT = 0.55  # avg_buy_price * 0.55 (catastrophe 40% → 60% of cos
 
 
 def test_excluded_ticker_has_zero_sip():
-    stocks = [_stock(sid="NCD", series=[90.0, 88.0], invested_cost=50000.0)]
+    stocks = [_stock(sid="NCD", series=[90.0, 88.0], invested=50000.0)]
     totals = s4.build_portfolio_totals(stocks, excluded_tickers={EXCLUDED_TICKER})
     assert totals.total_invested_cost == 0.0
     rows = s4.evaluate_signals([stocks[0]], totals, 0.12, excluded_tickers={EXCLUDED_TICKER})
@@ -53,7 +53,7 @@ def test_excluded_ticker_has_zero_sip():
 
 
 def test_gtt_catastrophe_floor_for_incubating():
-    stocks = [_stock(sid="INC", series=[80.0]*30, invested_cost=90000.0, avg_buy_price=200.0)]
+    stocks = [_stock(sid="INC", series=[80.0]*30, invested=90000.0, avg_buy_price=200.0)]
     totals = s4.build_portfolio_totals(stocks)
     metrics = s4.analyzeStockSignals(stocks[0], totals, 0.12)
     assert metrics.get("incubation") is True
@@ -62,7 +62,7 @@ def test_gtt_catastrophe_floor_for_incubating():
 
 
 def test_gtt_cost_floor_graduated():
-    stocks = [_stock(sid="GRD", series=[150.0]*50, invested_cost=80000.0, avg_buy_price=120.0)]
+    stocks = [_stock(sid="GRD", series=[150.0]*50, invested=80000.0, avg_buy_price=120.0)]
     totals = s4.build_portfolio_totals(stocks)
     metrics = s4.analyzeStockSignals(stocks[0], totals, 0.12)
     vol = metrics.get("annual_volatility")
@@ -73,7 +73,7 @@ def test_gtt_cost_floor_graduated():
 
 
 def test_hard_stop_overrides_warning():
-    stocks = [_stock(sid="HARD", series=[100.0]*30, invested_cost=150000.0, avg_buy_price=100.0, xirr=-0.05, holding_start_date=date(2023,1,1))]
+    stocks = [_stock(sid="HARD", series=[100.0]*30, invested=150000.0, avg_buy_price=100.0, xirr=-0.05, holding_start_date=date(2023,1,1))]
     totals = s4.build_portfolio_totals(stocks)
     sig = s4.evaluate_signal(stocks[0], s4.SigResult(security_id="HARD", signal_type="HARD_STOP_LOSS", priority=99, action="SELL", target_sell_rupees=50000.0, shares_to_sell=1000, reason=""), totals, as_of_date=date(2025,1,1), trim_aer=1.85, min_market_value=200000.0, max_stock_weight_pct=0.08)
     row = sig.as_dict()

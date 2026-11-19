@@ -136,13 +136,25 @@ def _tot() -> s4.PortfolioTotals:
 
 
 def test_gtt_incubation_catastrophe_floor():
-    # Invested < ₹1,00,000 -> incubating -> GTT = avg * 0.60, Catastrophe Floor (40%)
+    # Invested < ₹1,00,000 BUT held > 365 days -> NOT incubating; evaluated for Catastrophe Floor (40%)
     st = _stock("INC", series=[100.0] * 100, invested=50000.0, avg=100.0, mv=50000.0, xirr=0.10)
     m = s4.analyzeStockSignals(st, _tot(), 0.12, as_of_date=date(2026, 1, 1))
-    assert m["incubation"] is True
+    assert m["incubation"] is False
     assert m["gtt_anchor_type"] == "Catastrophe Floor (40%)"
     assert abs(m["gtt_stop_loss_price"] - 100.0 * 0.60) < 1e-6
     assert m["gtt_stop_loss_price"] >= 100.0 * 0.55
+
+
+def test_old_stock_not_re_entered_incubation_after_sell_below_cost():
+    # Held > 365 days (>1 year) with remaining cost below ₹1L after partial sell -> NOT incubating,
+    # should fall through to LAGGARD_EXIT / hard-stop evaluation instead of fresh ₹10k SIP.
+    st = _stock("OLD", series=[80.0]*30, invested=60000.0, avg=100.0, mv=60000.0, xirr=-0.02, start=date(2023,1,1))
+    m = s4.analyzeStockSignals(st, _tot(), 0.12, as_of_date=date(2026, 2, 1))
+    assert m["incubation"] is False   # days > 365 → never incubating again
+    assert m["gtt_anchor_type"] != "Catastrophe Floor (40%)"
+    # Should not get fresh 1.0x SIP; evaluate signals normally (not incubating lock).
+    rows = s4.evaluate_signals([st], _tot(), 0.12, as_of_date=date(2026, 2, 1))[0]
+    assert rows[0]["sip_multiplier"] == 0.0 or rows[0]["signal_type"] != "Incubating"
 
 
 def test_gtt_young_stock_incubation():

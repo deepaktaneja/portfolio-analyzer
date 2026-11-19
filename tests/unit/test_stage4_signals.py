@@ -472,3 +472,16 @@ def test_hard_stop_overrides_warning_level():
     assert r["warning_level"] is False
 
 
+
+def test_incubation_old_stock_after_sell_below_cost():
+    # Held > 365 days (>1 year) with remaining cost below ₹1L after partial sell -> NOT incubating,
+    # should fall through to LAGGARD_EXIT / hard-stop evaluation instead of fresh ₹10k SIP.
+    series = [80.0] * 30
+    st = _stock("OLD", series=series, invested=60000.0, avg=100.0, mv=60000.0, xirr=-0.02, start=date(2023,1,1))
+    totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
+    m = s4.analyzeStockSignals(st, totals, 0.12, as_of_date=date(2026, 2, 1))
+    assert m["incubation"] is False   # days > 365 → never incubating again
+    rows = s4.evaluate_signals([st], totals, 0.12, as_of_date=date(2026, 2, 1))[0]
+    assert rows[0]["sip_multiplier"] == 0.0 or rows[0]["signal_type"] != "Incubating"
+
+

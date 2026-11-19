@@ -53,7 +53,8 @@ TRIM_MIN_XIRR = 0.25
 TRIM_TARGET_MULT = 1.40
 
 INCUBATION_MAX_INVESTED = 100000.0     # below this => incubating
-INCUBATION_MAX_DAYS = 180              # or under 180 days since first buy => incubating
+INCUBATION_MAX_DAYS = 180               # or under 180 days since first buy => incubating
+INCUBATION_MAX_AGE_DAYS = 365           # or under 365 days since first buy => incubating
 INCUBATION_GTT_MULT = 0.60             # incubation GTT = 40% catastrophe circuit breaker
 GTT_BUFFER_WARN = 0.10                 # warn when within 10% of GTT trigger
 
@@ -106,7 +107,7 @@ class StockInput:
     symbol: str = ""
     quantity: float = 0.0
     avg_buy_price: float = 0.0
-    invested_cost: float = 0.0
+    invested: float = 0.0
     market_value: float | None = None
     xirr: float | None = None
     holding_start_date: date | None = None
@@ -123,7 +124,7 @@ class StockInput:
 class PortfolioTotals:
     """Portfolio-level aggregates used for weighting."""
 
-    total_invested_cost: float = 0.0
+    total_invested: float = 0.0
     total_market_value: float = 0.0
 
 
@@ -219,17 +220,24 @@ def _dynamic_stop_loss_pct(annual_vol: float | None,
 # Core per-stock metric function
 # --------------------------------------------------------------------------- #
 def _incubation(stock: StockInput, as_of_date=None) -> bool:
-    """True while a position is still in Incubation Mode (small OR young)."""
-    if stock.invested_cost is not None and stock.invested_cost < INCUBATION_MAX_INVESTED:
-        return True
+    """True while a position is still in Incubation Mode (small OR young).
+
+    A stock enters Incubation Mode **only** if BOTH hold:
+      * fewer than 365 days have passed since its first buy, AND
+      * either its remaining invested_cost is below ₹1,00,000 OR it has been held < 180 days.
+    Once ``days_since_first_buy`` reaches 365 (held > 1 year), the stock can NEVER re-enter
+    Incubation Mode — even if partial sells drive the remaining cost under ₹1L — so such old stub
+    positions are evaluated for LAGGARD_EXIT instead of receiving fresh SIPs.
+    """
+    if stock.invested_cost is None:
+        return False
+    days = 0
     if as_of_date is not None and stock.holding_start_date is not None:
         try:
-            days = (_to_date(as_of_date) - _to_date(stock.holding_start_date)).days
+            days = (date.fromisoformat(as_of_date) - date.fromisoformat(stock.holding_start_date)).days
         except (TypeError, ValueError):
             return False
-        if days < INCUBATION_MAX_DAYS:
-            return True
-    return False
+    return days < INCUBATION_MAX_AGE_DAYS and (stock.invested_cost < INCUBATION_MAX_INVESTED or days < 180)
 
 
 def _peak_price_52w(price_series, price_dates, holding_start_date):
