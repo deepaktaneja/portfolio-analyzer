@@ -55,6 +55,8 @@ TRIM_TARGET_MULT = 1.40
 INCUBATION_MAX_INVESTED = 100000.0     # below this => incubating
 INCUBATION_MAX_DAYS = 180               # or under 180 days since first buy => incubating
 INCUBATION_MAX_AGE_DAYS = 365           # or under 365 days since first buy => incubating
+
+MIN_PRICE_HISTORY_DAY = 200   # fewer than this many trading days => missing price history badge
 INCUBATION_GTT_MULT = 0.60             # incubation GTT = 40% catastrophe circuit breaker
 GTT_BUFFER_WARN = 0.10                 # warn when within 10% of GTT trigger
 
@@ -663,59 +665,50 @@ def import_watchlist_price_history(sid, csv_bytes):
 
 
 def compute_fixed_budget_sip_allocation(active_rows, watchlist_entries, total_deployable_budget=300000.0, max_single_stock_sip=35000.0, granularity=5000.0):
-    raise NotImplementedError("Placeholder — full budget allocation logic needed.")
-    rows: list[dict] = []
-    for stock in stocks or []:
-        metrics = analyzeStockSignals(stock, portfolioTotals, benchmarkXIRR,
-                                      stop_loss_mult=stop_loss_mult, as_of_date=as_of_date,
-                                      excluded_tickers=excluded_tickers)
-        sig = evaluate_signal(stock, metrics, portfolioTotals, as_of_date,
-                              trim_aer=trim_aer, min_market_value=min_market_value,
-                              excluded_tickers=excluded_tickers)
-        frozen = sig.signal_type in FROZEN_SIGNALS
-        sip = compute_sip_multiplier(stock, metrics, benchmarkXIRR, frozen=frozen,
-                                     max_stock_weight_pct=max_stock_weight_pct,
-                                     excluded_tickers=excluded_tickers)
-        # Incubating positions are locked at 1.0x regardless of technicals.
-        if metrics.get("incubation"):
-            sip = 1.0
-        # LAGGARD_EXIT is a deliberate exit: pause SIP and never a warning.
-        is_laggard_exit = sig.signal_type == LAGGARD_EXIT
-        if is_laggard_exit:
-            sip = 0.0
-        sig.sip_multiplier = sip
-        row = sig.as_dict()
-        row["holding_start_date"] = (
-            str(stock.holding_start_date) if stock.holding_start_date else None
-        )
-        row["is_bottom_laggard"] = False
-        # Warning Level: graduated, not hard-stopped, NOT a run-up / over-allocated
-        # hold-winners pause, and either frozen at 0.0x (broken trend) OR within
-        # GTT_BUFFER_WARN of the GTT stop. HARD_STOP_LOSS, the 0.0x Run-Up Freeze
-        # (dma200_distance > +30%) and the Over-Allocated Freeze (AER >= 1.35) all
-        # keep warning_level False.
-        buf = row.get("gtt_buffer_pct")
-        is_hard_stop = sig.signal_type == HARD_STOP_LOSS
-        aer_m = metrics.get("aer")
-        dma_dist = metrics.get("dma200_distance_pct")
-        run_up = dma_dist is not None and dma_dist > SIP_RUN_UP_DMA_DISTANCE
-        over_allocated = (aer_m is not None and aer_m >= SIP_OVERALLOC_AER)
-        row["run_up_freeze"] = bool((not metrics.get("incubation")) and run_up)
-        row["over_allocated"] = bool((not metrics.get("incubation")) and over_allocated)
-        pause_hold = row["run_up_freeze"] or row["over_allocated"]
-        row["warning_level"] = bool(
-            (not is_hard_stop)
-            and (not is_laggard_exit)
-            and (not metrics.get("incubation"))
-            and (not pause_hold)
-            and ((sip == 0.0) or (buf is not None and buf <= GTT_BUFFER_WARN))
-        )
-        rows.append(row)
+    """Allocate the fixed monthly cash-flow pool so total outflows never exceed ``total_deployable_budget``.
 
-    # Flag the Bottom-5 laggards by Efficiency Score (ascending).
-    for r in rank_bottom_laggards(rows, n=5):
-        r["is_bottom_laggard"] = True
-    return rows
+    Steps
+    -----
+    1. **Incubating SIPs** – every non-excluded stock whose `sip_multiplier == 1.0` (locked incubation) counts its starter SIP.
+       Watchlist entries each get a starter SIP of ₹10,000 unless they have only a manual CMP (→ ₹5,000 tier-C toe-hold).
+    2. **Remaining graduated budget** = ``max(0, total_deployable_budget - total_incubating_sip)``.
+    3. Run existing ``compute_monthly_sip_allocation(active_rows, remaining_graduated_budget, ...)`` to distribute across graduated stocks.
+    4. Unallocated remainder becomes liquid cash overflow.
+
+    Returns
+    -------
+        dict with keys: rows, deployable_budget, total_allocated, parked_cash, total_units, all_frozen, carry_forward_cash.
+    """
+    # Step 1: incubating SIPs
+    inc_sips = 0.0
+    for entry in watchlist_entries:
+        if entry.get("imported_prices"):
+            sip = 10000.0  # sufficient price history → fast-track
+        elif entry.get("manual_cmp") is not None:
+            # Only manual CMP → toe-hold tier C (₹5k)
+            sip = INCUBATION_TIER_C_SIP if len(entry.get("imported_prices", [])) < MIN_PRICE_HISTORY_DAY else 10000.0
+        else:
+            sip = 10000.0
+        inc_sips += sip
+
+    active_sips = sum(
+        float(r.get("sip_multiplier") or 0) for r in active_rows if float(r.get("sip_multiplier") or 0) > 0
+    )
+    total_incubating_sip = inc_sips + active_sips
+
+    remaining_graduated_budget = max(0.0, total_deployable_budget - total_incubating_sip)
+
+    alloc = s4.compute_monthly_sip_allocation(active_rows, remaining_graduated_budget, harvested_cash=0.0, max_single_stock_sip=max_single_stock_sip)
+    result = {
+        "rows": alloc["rows"],
+        "deployable_budget": alloc["deployable_budget"],
+        "total_allocated": alloc["total_allocated"] + total_incubating_sip,
+        "parked_cash": alloc["parked_cash"],
+        "total_units": alloc["total_multiplier_units"],
+        "all_frozen": alloc["all_frozen"],
+        "carry_forward_cash": alloc["carry_forward_cash"],
+    }
+    return result
 
 
 def rank_bottom_laggards(rows, n: int = 5) -> list[dict]:
@@ -1190,4 +1183,3 @@ def build_portfolio_totals(stocks, excluded_tickers: set[str] = None) -> Portfol
         total_cost += float(s.invested_cost or 0.0)
         total_mv += float(s.market_value or 0.0)
     return PortfolioTotals(total_invested_cost=total_cost, total_market_value=total_mv)
-
