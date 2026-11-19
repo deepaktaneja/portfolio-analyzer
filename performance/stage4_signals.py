@@ -253,7 +253,8 @@ def _peak_price_52w(price_series, price_dates, holding_start_date):
 def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
                         benchmarkXIRR: float | None,
                         stop_loss_mult: float = STOP_LOSS_MULT,
-                        as_of_date=None) -> dict:
+                        as_of_date=None,
+                        excluded_tickers: set[str] = None) -> dict:
     """Compute the full metric bundle for one stock.
 
     Returns a dict with the 50/200-DMA, annualised volatility, dynamic
@@ -267,6 +268,12 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
     """
     series = [float(x) for x in (stock.price_series or []) if x is not None]
     n = len(series)
+
+    excluded = False
+    if excluded_tickers is not None:
+        sid = str(stock.security_id).strip().upper()
+        if sid in excluded_tickers:
+            excluded = True
 
     dma_short = _sma(series, DMA_SHORT)
     dma_long = _sma(series, DMA_LONG)
@@ -339,7 +346,9 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
         "gtt_anchor_price": gtt_anchor_price,
         "trading_days": n,
         "insufficient_data": n < MIN_TRADING_DAYS,
+        "excluded": excluded,
     }
+    metrics["excluded"] = excluded
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +365,8 @@ def _held_days(stock: StockInput, as_of_date) -> int | None:
 
 def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: PortfolioTotals,
                     as_of_date=None, trim_aer: float = TRIM_AER,
-                    min_market_value: float = TRIM_MIN_MARKET_VALUE) -> SignalResult:
+                    min_market_value: float = TRIM_MIN_MARKET_VALUE,
+                    excluded_tickers: set[str] = None) -> SignalResult:
     """Apply the four signal rules in strict priority order for one stock.
 
     ``trim_aer`` and ``min_market_value`` override the CONCENTRATION_TRIM
@@ -429,7 +439,11 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
 # --------------------------------------------------------------------------- #
 def compute_sip_multiplier(stock: StockInput, metrics: dict, benchmarkXIRR: float | None,
                            frozen: bool = False,
-                           max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT) -> float:
+                           max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT,
+                           excluded_tickers: set[str] = None) -> float:
+    # Force zero SIP for excluded tickers so they don't consume budget or get buy signals.
+    if excluded_tickers is not None and stock.security_id.strip().upper() in excluded_tickers:
+        return 0.0
     """Return the monthly SIP multiplier (0.0 / 1.0 / 2.0) for a graduated stock.
 
     Four-lane ladder keyed off dma200_distance_pct = (CMP - 200-DMA) / 200-DMA:
@@ -509,17 +523,21 @@ def evaluate_signals(stocks, portfolioTotals: PortfolioTotals,
                      benchmarkXIRR: float | None, as_of_date=None,
                      trim_aer: float = TRIM_AER, stop_loss_mult: float = STOP_LOSS_MULT,
                      min_market_value: float = TRIM_MIN_MARKET_VALUE,
-                     max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT) -> list[dict]:
+                     max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT,
+                     excluded_tickers: set[str] = None) -> list[dict]:
     """Evaluate every stock and return enriched, priority-annotated rows."""
     rows: list[dict] = []
     for stock in stocks or []:
         metrics = analyzeStockSignals(stock, portfolioTotals, benchmarkXIRR,
-                                      stop_loss_mult=stop_loss_mult, as_of_date=as_of_date)
+                                      stop_loss_mult=stop_loss_mult, as_of_date=as_of_date,
+                                      excluded_tickers=excluded_tickers)
         sig = evaluate_signal(stock, metrics, portfolioTotals, as_of_date,
-                              trim_aer=trim_aer, min_market_value=min_market_value)
+                              trim_aer=trim_aer, min_market_value=min_market_value,
+                              excluded_tickers=excluded_tickers)
         frozen = sig.signal_type in FROZEN_SIGNALS
         sip = compute_sip_multiplier(stock, metrics, benchmarkXIRR, frozen=frozen,
-                                     max_stock_weight_pct=max_stock_weight_pct)
+                                     max_stock_weight_pct=max_stock_weight_pct,
+                                     excluded_tickers=excluded_tickers)
         # Incubating positions are locked at 1.0x regardless of technicals.
         if metrics.get("incubation"):
             sip = 1.0
@@ -1019,11 +1037,18 @@ def build_stock_input(transactions, price_lookup, as_of_date, security_id,
     )
 
 
-def build_portfolio_totals(stocks) -> PortfolioTotals:
-    """Sum invested cost and market value across :class:`StockInput` objects."""
+def build_portfolio_totals(stocks, excluded_tickers: set[str] = None) -> PortfolioTotals:
+    """Sum invested cost and market value across :class:`StockInput` objects.
+
+    Excluded tickers (set[str]) are subtracted from both total_invested_cost and total_market_value so
+    AER (Market Weight / Cost Weight) denominators ignore non-equity holdings like NCDs.
+    """
     total_cost = 0.0
     total_mv = 0.0
     for s in stocks or []:
+        sid = str(s.security_id).strip().upper() if s.security_id else ""
+        if excluded_tickers is not None and (sid in excluded_tickers or s.invested_cost is None):
+            continue
         total_cost += float(s.invested_cost or 0.0)
         total_mv += float(s.market_value or 0.0)
     return PortfolioTotals(total_invested_cost=total_cost, total_market_value=total_mv)

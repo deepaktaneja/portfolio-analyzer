@@ -1703,6 +1703,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     amber_flags = []
     csv_rows = []
     for r in arows:
+        is_excluded = r.get("excluded", False)
         is_hard_stop = r.get("signal_type") == s4.HARD_STOP_LOSS
         am = (not is_hard_stop) and (
             bool(r.get("warning_level"))
@@ -1726,6 +1727,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
             "Stock": _name(r["security_id"]),
             "CMP": f"{r['cmp']:,.1f}" if r.get("cmp") else "N/A",
             "Stage": stage,
+            "Excluded": str(is_excluded),
             "200-DMA": _dma_dist(r),
             "AER": f"{r['aer']:.2f}x" if r.get("aer") is not None else "N/A",
             "Signal": _badge(r),
@@ -1744,12 +1746,14 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         csv_rows.append({
             "Stock Ticker": r["security_id"],
             "Stage": stage,
+            "Excluded": str(is_excluded),
             "Action": _action,
             "Lane / Signal": _badge(r),
             "SIP Amount (Rs)": round(sip_amt, 2),
             "Est. Shares": int(r.get("est_shares") or 0),
             "Updated GTT Trigger (Rs)": round(float(r.get("gtt_stop_loss_price") or 0.0), 2),
             "GTT Anchor Type": r.get("gtt_anchor_type") or "",
+            "Note": "EXCLUDED — DO NOT BUY" if is_excluded else "",
         })
 
     df_disp = pd.DataFrame(disp_rows)
