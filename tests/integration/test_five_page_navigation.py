@@ -1,6 +1,6 @@
-"""Verify the refactored 5-page navigation structure.
+"""Verify the refactored 4-page navigation structure.
 
-Ensures exactly 5 top-level pages exist and every page renders without
+Ensures exactly 4 top-level pages exist and every page renders without
 exceptions (using an isolated empty data environment for speed). Also confirms
 the reusable page/component modules import cleanly.
 """
@@ -16,8 +16,7 @@ EXPECTED_PAGES = [
     "1 · Portfolio",
     "2 · Direct Equity",
     "3 · Mutual Funds",
-    "4 · Backtesting",
-    "5 · Data & Settings",
+    "4 · Data & Settings",
 ]
 
 
@@ -45,7 +44,7 @@ def test_components_import():
         assert hasattr(ui, fn)
 
 
-def test_exactly_five_pages(isolated_env):
+def test_exactly_four_pages(isolated_env):
     at = AppTest.from_file("/Users/anmol/portfolio-analyzer/app.py", default_timeout=120)
     at.run()
     nav = None
@@ -55,7 +54,7 @@ def test_exactly_five_pages(isolated_env):
             break
     assert nav is not None, "Page navigation radio missing"
     assert list(nav.options) == EXPECTED_PAGES
-    assert len(EXPECTED_PAGES) == 5
+    assert len(EXPECTED_PAGES) == 4
 
 
 def test_each_page_renders(isolated_env):

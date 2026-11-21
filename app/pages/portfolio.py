@@ -1,9 +1,9 @@
 """Page 1 — Portfolio.
 
 Consolidated Equity + MF overview: total value, invested capital, gains, XIRR,
-dividends, asset allocation, sector exposure, concentration, top holdings and
-portfolio-level alerts. Consolidates the former Overview, MF Overview,
-Consolidated Overview and Consolidated Allocation tabs.
+dividends, asset allocation, risk-adjusted metrics (volatility/Sharpe/Sortino/
+max drawdown) and holding-level return attribution. Consolidates the former
+Overview, MF Overview, Consolidated Overview and Consolidated Allocation tabs.
 """
 from __future__ import annotations
 
@@ -440,12 +440,211 @@ def _cumulative_series(rows):
     return xs, ypf, y50, y500, has50, has500
 
 
+def _render_risk_metrics(ctx: AppContext) -> None:
+    """Risk-adjusted metrics card (volatility, Sharpe, Sortino, max drawdown).
+
+    Respects Page 1's active Asset Type / Member / date filters (already applied
+    to ``ctx.txs`` and ``ctx.pl``). Rendered directly below the Allocation panel.
+    """
+    from datetime import date as _d
+
+    from mf import analytics as mf_analytics
+    from performance.xirr import portfolio_value_series
+
+    st.markdown("#### Risk-Adjusted Metrics")
+    f = ctx.filters
+    start = f.start_date
+    end = f.end_date or _d.today()
+
+    try:
+        series = portfolio_value_series(
+            ctx.txs,
+            price_lookup=ctx.pl,
+            start_date=start,
+            end_date=end,
+            opening_positions=ctx.opening_positions,
+        )
+    except Exception:  # noqa: BLE001
+        series = []
+
+    if len(series) < 3:
+        st.caption("Not enough monthly valuation points in this period to compute risk metrics.")
+        return
+
+    rets = mf_analytics.periodic_returns(series)
+    vol = mf_analytics.annualized_volatility(rets, periods_per_year=12)
+    sharpe = mf_analytics.sharpe_ratio(rets, risk_free_annual=0.06, periods_per_year=12)
+    sortino = mf_analytics.sortino_ratio(rets, risk_free_annual=0.06, periods_per_year=12)
+    mdd = mf_analytics.max_drawdown(series)
+
+    def _p(v):
+        return fmt_pct(v) if v is not None else "N/A"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Annualised Volatility", _p(vol))
+    c2.metric("Sharpe (rf 6%)", f"{sharpe:.2f}" if sharpe is not None else "N/A")
+    c3.metric("Sortino (rf 6%)", f"{sortino:.2f}" if sortino is not None else "N/A")
+    c4.metric("Max Drawdown", _p(mdd.get("max_drawdown")) if mdd else "N/A")
+    if mdd:
+        st.caption(
+            f"Max drawdown peak {mdd.get('peak_date')} \u2192 trough {mdd.get('trough_date')}. "
+            f"Monthly valuations: {len(series)} points."
+        )
+    st.caption(
+        "Volatility / Sharpe / Sortino use month-end portfolio valuations "
+        "(12 periods per year) with a 6% annual risk-free rate."
+    )
+
+
+def _render_holding_attribution(ctx: AppContext, holdings) -> None:
+    """Stock-level return attribution table (current holdings + sold-off positions).
+
+    Filtered by Page 1's active Asset Type and Member filters (member scoping is
+    already applied to ``ctx.txs``; asset type gates whether equity rows show).
+    """
+    from collections import defaultdict
+    from datetime import date as _d
+
+    import pandas as pd
+
+    st.markdown("#### Holding-Level Return Attribution")
+    f = ctx.filters
+    if f.asset_type == "Mutual Funds":
+        st.caption("Switch Asset Type to 'All' or 'Direct Equity' to see stock-level attribution.")
+        return
+
+    from accounting.fifo import get_fifo_lots
+    from performance import equity_analytics as ea
+
+    txs = ctx.txs
+    end = f.end_date or _d.today()
+    end = end if isinstance(end, _d) else _d.fromisoformat(str(end)[:10])
+    start = f.start_date
+    if start is None:
+        start = _d(2000, 1, 1)
+    elif not isinstance(start, _d):
+        start = _d.fromisoformat(str(start)[:10])
+
+    def _idx(d):
+        try:
+            from market_data.prices import get_index_tri
+
+            return get_index_tri("NIFTY50TRI", str(d)[:10], db_path=ctx.market_db_path)
+        except Exception:  # noqa: BLE001
+            return None
+
+    lots = get_fifo_lots(txs, None, as_of_date=end)
+    agg = defaultdict(lambda: [0.0, 0.0])
+    for lot in lots:
+        agg[lot["isin"]][0] += float(lot["qty"])
+        agg[lot["isin"]][1] += float(lot["cost"])
+
+    sector_map = {}
+    if holdings is not None and not getattr(holdings, "empty", True) and "isin" in holdings.columns:
+        for _, rr in holdings.iterrows():
+            sector_map[str(rr.get("isin") or "").strip().upper()] = rr.get("sector")
+
+    def _cmp(sid):
+        try:
+            p = ctx.pl(sid, end)
+        except Exception:  # noqa: BLE001
+            return None
+        return float(p) if p is not None else None
+
+    current_isins = [i for i, v in agg.items() if v[0] > 1e-6]
+    total_mv = 0.0
+    cur = {}
+    for sid in current_isins:
+        q = agg[sid][0]
+        cmp = _cmp(sid)
+        cv = (q * cmp) if cmp is not None else None
+        cur[sid] = (q, cmp, cv)
+        if cv:
+            total_mv += cv
+
+    current_rows = []
+    for sid in sorted(current_isins):
+        q, cmp, cv = cur[sid]
+        cost = agg[sid][1]
+        sx = ea.stock_xirr(txs, ctx.dividend_flows, sid, start, end,
+                           terminal_value=cv, terminal_date=end)
+        stwr = ea.stock_twr(txs, ctx.pl, sid, start, end)
+        flows = ea.stock_flows(txs, ctx.dividend_flows, sid, start, end)
+        bx = ea.benchmark_xirr_for_flows(flows, _idx, start, end)
+        al = ea.alpha(sx, bx)
+        weight = (cv / total_mv * 100.0) if (cv and total_mv > 0) else None
+        current_rows.append({
+            "Stock": security_name(sid, txs, holdings),
+            "Sector": sector_map.get(sid) or "",
+            "Invested": round(cost, 2),
+            "Current": round(cv, 2) if cv is not None else None,
+            "Gain": (round(cv - cost, 2) if cv is not None else None),
+            "Weight %": (None if weight is None else round(weight, 2)),
+            "Stock XIRR %": (None if sx is None else round(sx * 100.0, 2)),
+            "Stock TWR %": (None if stwr is None else round(stwr * 100.0, 2)),
+            "Alpha %": (None if al is None else round(al * 100.0, 2)),
+        })
+
+    st.markdown("##### Current Holdings")
+    ui.safe_dataframe(pd.DataFrame(current_rows), key="p1_attr_current",
+                      empty_message="No current equity holdings.")
+
+    sold_isins = set()
+    for t in txs or []:
+        if str(t.get("buy_sell") or "").strip().upper() == "SELL":
+            sid = str(t.get("isin") or "").strip().upper()
+            if sid:
+                sold_isins.add(sid)
+    exited_isins = [sid for sid in sold_isins if agg.get(sid, [0.0, 0.0])[0] <= 1e-6]
+
+    exited_rows = []
+    for sid in sorted(exited_isins):
+        buys, sells = [], []
+        for t in txs or []:
+            if str(t.get("isin") or "").strip().upper() != sid:
+                continue
+            try:
+                dd = ea._to_date(ea._tx_date(t))
+            except (TypeError, ValueError):
+                continue
+            amt = abs(float(t.get("net_amount") or 0.0))
+            side = str(t.get("buy_sell") or "").strip().upper()
+            if side in ("BUY", "OPENING", "OPEN", "OPENING_POSITION"):
+                buys.append((dd, amt))
+            elif side == "SELL":
+                sells.append((dd, amt))
+        if not buys or not sells:
+            continue
+        first_buy = min(d for d, _ in buys)
+        final_sell = max(d for d, _ in sells)
+        if final_sell < first_buy:
+            continue
+        deployed = sum(a for _, a in buys)
+        exit_val = sum(a for _, a in sells)
+        pnl = exit_val - deployed
+        pnl_pct = (pnl / deployed * 100.0) if deployed else None
+        rx = ea.stock_xirr(txs, ctx.dividend_flows, sid, first_buy, final_sell)
+        exited_rows.append({
+            "Stock": security_name(sid, txs, holdings),
+            "Sector": sector_map.get(sid) or "",
+            "Holding Period": f"{first_buy} to {final_sell}",
+            "Deployed": round(deployed, 2),
+            "Exit Value": round(exit_val, 2),
+            "P&L": round(pnl, 2),
+            "P&L %": (None if pnl_pct is None else round(pnl_pct, 2)),
+            "Realized XIRR %": (None if rx is None else round(rx * 100.0, 2)),
+        })
+
+    if exited_rows:
+        st.markdown("##### Sold-Off Positions")
+        ui.safe_dataframe(pd.DataFrame(exited_rows), key="p1_attr_exited")
+
+
 def render(ctx: AppContext) -> None:
     holdings = ctx.holdings
-    f = ctx.filters
 
     st.markdown("### Portfolio Overview")
-    st.caption("Consolidated Equity + Mutual Fund view.")
+    st.caption("Consolidated Equity + Mutual Fund view with allocation, risk & attribution insights.")
 
     _mf, _nav_by_scheme, _mf_txs, _mf_folder = _mf_scope(ctx)
     _render_consolidated(ctx, _mf, _nav_by_scheme, _mf_txs)
@@ -454,20 +653,13 @@ def render(ctx: AppContext) -> None:
     _render_allocation_section(ctx, _mf, holdings)
     st.divider()
 
-    _render_returns_by_investment_type(ctx, _mf, holdings, _mf_txs, _nav_by_scheme)
+    _render_risk_metrics(ctx)
     st.divider()
-    if f.show_equity or f.show_mf:
-        try:
-            from alerts.ui import render_alert_center
-            render_alert_center(ctx)
-        except Exception:  # noqa: BLE001
-            st.caption("Alert center unavailable")
 
-    try:
-        from copilot.ui import render_copilot
-        render_copilot(ctx, "portfolio")
-    except Exception:  # noqa: BLE001, S110
-        pass
+    _render_holding_attribution(ctx, holdings)
+    st.divider()
+
+    _render_returns_by_investment_type(ctx, _mf, holdings, _mf_txs, _nav_by_scheme)
 
 
 def _render_consolidated(ctx, mf, nav_by_scheme, mf_txs) -> None:
@@ -1053,7 +1245,7 @@ def _render_benchmark_xirr(ctx, res, start, end) -> None:
             finally:
                 try:
                     _os.remove(tmp)
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     def _idx(iid):

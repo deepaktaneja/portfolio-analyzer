@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import date as _date
 
@@ -110,6 +111,176 @@ def resolve_provider_symbol(security_id, db_path=None, provider=None):
         sym = str(r.get("provider_symbol") or r.get("symbol") or "").strip()
         if sym:
             return sym
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ISIN <-> NSE ticker normalisation
+# ---------------------------------------------------------------------------
+# A stock may be referenced by ISIN (e.g. ``INE192B01031``) or by an NSE ticker
+# (e.g. ``SJS`` or ``SJS.NS``). Prices must resolve to the *same* series no
+# matter which identifier the caller used, and new prices should be stored under
+# one canonical key (the NSE ticker, which is what yfinance expects).
+_INDIAN_ISIN_RE = re.compile(r"^IN[A-Z0-9]{9}[0-9]$")
+
+
+def is_isin(value) -> bool:
+    """True for a 12-char Indian ISIN (starts ``IN``, ends with a check digit)."""
+    return bool(_INDIAN_ISIN_RE.match(str(value or "").strip().upper()))
+
+
+def _normalize_ticker(value) -> str:
+    """Return an NSE yfinance-style ticker (``SJS`` -> ``SJS.NS``)."""
+    t = str(value or "").strip().upper()
+    if not t:
+        return ""
+    if t.startswith("^") or "." in t:  # index / already-suffixed
+        return t
+    return t + ".NS"
+
+
+def normalize_security_id(security_id, db_path=None):
+    """Resolve any input (ISIN or NSE ticker) to a canonical identity.
+
+    Returns a dict with ``input``, ``isin``, ``nse_ticker``, ``canonical`` (the
+    key prices should be stored/queried under) and ``aliases`` — every identifier
+    that may legitimately key ``stock_prices`` rows for this stock.
+    """
+    raw = str(security_id or "").strip().upper()
+    result = {"input": raw, "isin": None, "nse_ticker": None, "canonical": raw, "aliases": []}
+    if not raw:
+        return result
+    try:
+        store = _store(db_path)
+    except Exception:  # noqa: BLE001
+        store = None
+
+    isin = None
+    nse_ticker = None
+
+    if is_isin(raw):
+        isin = raw
+        # ISIN -> ticker via the instrument symbol map.
+        try:
+            for r in store.get_symbol_map(security_id=isin) if store else []:
+                sym = str(r.get("provider_symbol") or r.get("symbol") or "").strip().upper()
+                if sym:
+                    nse_ticker = _normalize_ticker(sym)
+                    break
+        except Exception:  # noqa: BLE001
+            nse_ticker = None
+        # ISIN -> ticker via the watchlist table as a secondary mapper.
+        if not nse_ticker and store is not None:
+            try:
+                wl = store.get_watchlist_stock(isin=isin)
+                if wl and wl.get("nse_ticker"):
+                    nse_ticker = _normalize_ticker(wl["nse_ticker"])
+            except Exception:  # noqa: BLE001, S110
+                pass
+    else:
+        nse_ticker = _normalize_ticker(raw)
+        base = raw.split(".")[0]
+        # ticker -> ISIN via the symbol map (reverse lookup).
+        try:
+            for r in store.get_symbol_map() if store else []:
+                sym = str(r.get("provider_symbol") or r.get("symbol") or "").strip().upper()
+                sid = str(r.get("security_id") or "").strip().upper()
+                if is_isin(sid) and sym and sym.split(".")[0] == base:
+                    isin = sid
+                    break
+        except Exception:  # noqa: BLE001, S110
+            pass
+        if not isin and store is not None:
+            try:
+                wl = store.get_watchlist_stock(nse_ticker=nse_ticker)
+                if wl and wl.get("isin"):
+                    isin = str(wl["isin"]).strip().upper()
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+    canonical = nse_ticker or isin or raw
+    aliases = []
+    for cand in (nse_ticker, isin, raw, (nse_ticker or "").split(".")[0] if nse_ticker else None):
+        if cand and cand not in aliases:
+            aliases.append(cand)
+    result.update({"isin": isin, "nse_ticker": nse_ticker, "canonical": canonical, "aliases": aliases})
+    return result
+
+
+def link_symbol_mapping(isin, nse_ticker, db_path=None, provider="yfinance"):
+    """Persist an ISIN -> NSE ticker mapping so future lookups unify both keys."""
+    sid = str(isin or "").strip().upper()
+    ticker = _normalize_ticker(nse_ticker)
+    if not sid or not ticker or not is_isin(sid):
+        return False
+    try:
+        store = _store(db_path)
+        store.upsert_security_symbol_map(
+            [{"security_id": sid, "symbol": ticker, "provider_symbol": ticker,
+              "exchange": "NSE", "provider": provider, "verification_status": "manual",
+              "verified": 1, "source": "watchlist"}],
+            preserve_verified=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_stock_prices_unified(security_id, start=None, end=None, db_path=None):
+    """Merge ``stock_prices`` rows across every alias (ISIN / ticker variants).
+
+    Querying by ISIN or by ``SJS`` / ``SJS.NS`` therefore returns the exact same
+    (deduplicated, ascending) ``[(trade_date, close)]`` series.
+    """
+    ident = normalize_security_id(security_id, db_path=db_path)
+    aliases = ident["aliases"] or [ident["input"]]
+    store = _store(db_path)
+    lo = str(start)[:10] if start else "0000-01-01"
+    hi = str(end)[:10] if end else "9999-12-31"
+    merged: dict[str, float] = {}
+    for alias in aliases:
+        try:
+            for td, close in store.get_stock_prices(alias, lo, hi):
+                merged.setdefault(str(td)[:10], float(close))
+        except Exception:  # noqa: BLE001, S112
+            continue
+    return sorted(merged.items())
+
+
+def resolve_company_name(security_id, nse_ticker=None, db_path=None, allow_network=True):
+    """Best-effort official company name for a security.
+
+    Order: persisted watchlist name -> instrument symbol-map ``notes`` ->
+    ``yfinance`` ``longName`` / ``shortName``.  Returns ``None`` when nothing
+    resolves (callers should then show the ticker, never a bare ISIN as a name).
+    """
+    ident = normalize_security_id(security_id, db_path=db_path)
+    ticker = _normalize_ticker(nse_ticker or ident.get("nse_ticker") or "")
+    isin = ident.get("isin")
+    try:
+        store = _store(db_path)
+        wl = store.get_watchlist_stock(nse_ticker=ticker) or (
+            store.get_watchlist_stock(isin=isin) if isin else None
+        )
+        if wl and wl.get("company_name"):
+            return str(wl["company_name"]).strip()
+        # Instrument master: reuse any name captured on the symbol map notes.
+        for r in store.get_symbol_map(security_id=isin) if isin else []:
+            notes = str(r.get("notes") or "").strip()
+            if notes:
+                return notes
+    except Exception:  # noqa: BLE001, S110
+        pass
+    if allow_network and ticker:
+        try:
+            import yfinance as yf  # optional dependency, imported lazily
+
+            info = yf.Ticker(ticker).info or {}
+            name = info.get("longName") or info.get("shortName")
+            if name:
+                return str(name).strip()
+        except Exception:  # noqa: BLE001
+            return None
     return None
 
 

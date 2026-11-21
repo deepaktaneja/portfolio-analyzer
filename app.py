@@ -1,11 +1,10 @@
-"""Investments Portfolio Analyzer — 5-page UI (refactored).
+"""Investments Portfolio Analyzer — 4-page UI (refactored).
 
 Navigation:
-  1. Portfolio           — consolidated Equity + MF overview & allocation
-  2. Performance         — annual/historical performance, benchmarks, gains, dividends
-  3. Holdings & Research — unified holdings table, detail panel, AI research
-  4. Backtesting         — stock-replacement simulator (actual vs hypothetical)
-  5. Data & Settings     — imports, reconciliation, market data, MCP & settings
+  1. Portfolio           — consolidated Equity + MF overview, allocation & risk hub
+  2. Direct Equity       — equity performance, benchmarks, signals & Stage 4E backtester
+  3. Mutual Funds        — unified holdings table, detail panel, AI research
+  4. Data & Settings     — imports, reconciliation, market data, MCP & settings
 
 All backend services, calculations and data are reused unchanged. UI logic lives
 in ``app/pages/`` with shared components in ``app/components/``.
@@ -17,8 +16,8 @@ import os
 import streamlit as st
 
 from app.components.filters import render_sidebar_filters
-from app.context import build_context
-from app.pages import backtesting, data_settings, holdings_research, performance, portfolio
+from app.context import Filters, build_context
+from app.pages import data_settings, holdings_research, performance, portfolio
 from app.shared import load_transactions
 
 st.set_page_config(page_title="ICICI Portfolio Analyzer", layout="wide")
@@ -36,22 +35,26 @@ if "all_txs" not in st.session_state:
     st.session_state["all_txs"] = load_transactions()
 txs = st.session_state["all_txs"]
 
-# ---- Global sidebar filters (shared across all pages) ----------------------
-filters = render_sidebar_filters(txs)
-
 # ---- Page navigation -------------------------------------------------------
 PAGES = {
     "1 · Portfolio": portfolio,
     "2 · Direct Equity": performance,
     "3 · Mutual Funds": holdings_research,
-    "4 · Backtesting": backtesting,
-    "5 · Data & Settings": data_settings,
+    "4 · Data & Settings": data_settings,
 }
 
 with st.sidebar:
     st.divider()
     st.header("Navigation")
     page_label = st.radio("Page", list(PAGES.keys()), index=0, key="nav_page")
+    st.divider()
+    # Page 2 (Direct Equity) hides the global filters so it stays clean and
+    # always evaluates the full Direct Equity book as of today. Every other
+    # page keeps the shared filters active (Page 1 is the primary consumer).
+    if page_label == "2 · Direct Equity":
+        filters = Filters(asset_type="Direct Equity")
+    else:
+        filters = render_sidebar_filters(txs)
 
 st.title("Investments Portfolio Analyzer")
 

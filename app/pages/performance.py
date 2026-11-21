@@ -1,13 +1,18 @@
 """Page 2 - Direct Equity.
 
-Direct equity portfolio performance vs benchmark, current value / invested / XIRR
-with a period selector, cumulative growth vs Nifty 50/500 TRI, equity sector &
-concentration breakdowns, risk-adjusted metrics, gains & dividends.
+A crisp monthly Direct Equity Decision Engine with three focused tabs:
+  1. Monthly Action & SIP Engine - Stage 4 sell/trim action cards + SIP planner.
+  2. Sector & Concentration - portfolio guardrail view.
+  3. Strategy Backtester (3Y / 5Y / 7Y) - Stage 4E walk-forward backtester.
+
+Descriptive KPIs, risk-adjusted metrics and holding-level attribution live on
+Page 1 (Portfolio); this page focuses on the once-a-month execution checklist.
 """
 from __future__ import annotations
 
 import math
 import os
+import re
 
 import pandas as pd
 import streamlit as st
@@ -1170,24 +1175,140 @@ def _inr_indian(n) -> str:
     return ",".join(parts) + "," + tail
 
 
+def _fmt_inr(value) -> str:
+    """Render a rupee amount with Indian grouping, e.g. 1368260 -> '₹13,68,260'."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"₹{_inr_indian(round(float(value)))}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_pct(value) -> str:
+    """Render a percentage already expressed in percent units (e.g. 13.66 -> '13.66%')."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_ratio(value) -> str:
+    """Render a ratio to two decimals (e.g. 1.2345 -> '1.23')."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _max_drawdown_of(values) -> float:
+    """Max peak-to-trough drawdown (fraction) of a value series; 0.0 if flat/missing."""
+    peak = float("-inf")
+    mdd = 0.0
+    for v in values or []:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(v):
+            continue
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = max(mdd, (peak - v) / peak)
+    return mdd
+
+
+def _actual_ledger_metrics(txs, price_lookup, dividend_flows, corporate_actions,
+                           opening_positions, start, end) -> dict | None:
+    """Real-ledger Direct Equity metrics over ``[start, end]`` (actual cashflows).
+
+    Uses the real transaction ledger (buys/sells/dividends/opening positions) to
+    compute money-weighted XIRR, ending holdings value, Max Drawdown on the
+    reconstructed value series, and a Return / Drawdown ratio. Returns ``None``
+    when the ledger can't be valued.
+    """
+    from datetime import date as _dt
+
+    from performance import xirr as px
+
+    try:
+        sd = _dt.fromisoformat(str(start)[:10])
+        ed = _dt.fromisoformat(str(end)[:10])
+    except (TypeError, ValueError):
+        return None
+    try:
+        res = px.calculate_portfolio_xirr(
+            txs, actions=corporate_actions, dividends=dividend_flows,
+            price_lookup=price_lookup, start_date=sd, end_date=ed,
+            opening_positions=opening_positions,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    flows = res.get("cashflows") or []
+    if not flows:
+        return None
+    invested = sum(-a for _d, a, _k in flows if a < 0)
+    proceeds = sum(a for _d, a, k in flows if a > 0 and k != "terminal_value")
+    terminal = sum(a for _d, a, k in flows if k == "terminal_value")
+    try:
+        series = px.portfolio_value_series(
+            txs, price_lookup=price_lookup, start_date=sd, end_date=ed,
+            opening_positions=opening_positions,
+        )
+    except Exception:  # noqa: BLE001
+        series = []
+    if terminal <= 0 and series:
+        terminal = series[-1][1]
+    total_back = proceeds + terminal
+    total_return = (total_back / invested - 1.0) if invested > 0 else None
+    mdd = _max_drawdown_of([v for _d, v in series])
+    if mdd > 0:
+        rd_ratio = (total_return / mdd) if total_return is not None else None
+    elif total_return is not None and total_return > 0:
+        rd_ratio = total_return
+    else:
+        rd_ratio = 0.0 if total_return is not None else None
+    xirr = res.get("xirr")
+    net_invested = invested - proceeds
+    return {
+        "invested": round(invested, 2),
+        "gross_invested": round(invested, 2),
+        "realized_sells": round(proceeds, 2),
+        "net_invested": round(net_invested, 2),
+        "final_value": round(terminal, 2),
+        "post_tax_xirr_pct": round(xirr * 100.0, 2) if xirr is not None else None,
+        "pre_tax_xirr_pct": round(xirr * 100.0, 2) if xirr is not None else None,
+        "max_drawdown_pct": round(mdd * 100.0, 2),
+        "return_drawdown_ratio": round(rd_ratio, 4) if rd_ratio is not None else None,
+        "taxes_paid": 0.0,
+        "friction_paid": 0.0,
+        "trade_count": sum(1 for _d, a, k in flows if k in ("buy", "sell")),
+    }
+
+
 def _stage4_playbook_markdown(live: dict) -> str:
     """Build the full Strategy Playbook markdown with live-synced parameters."""
     trim_aer = live.get("trim_aer", 1.85)
     stop_mult = live.get("stop_mult", 1.5)
     min_mv = live.get("min_mv", 200000)
     bench = live.get("bench_xirr", 0.12)
-    budget = live.get("budget", 300000)
+    budget = live.get("budget", 200000)
+    base_unit_sip = live.get("base_unit_sip", 10000)
     inc_max = live.get("inc_max", 100000)
     inc_days = live.get("inc_days", 180)
     inc_gtt = live.get("inc_gtt", 0.60)
     gtt_warn = live.get("gtt_warn", 0.10)
-    max_weight_pct = live.get("max_weight_pct", 8.0)
+    max_weight_pct = live.get("max_weight_pct", 8.0)  # noqa: F841
     L = []
     L.append("# Strategy Playbook & Rulebook — Direct Equity")
     L.append("")
     L.append(f"_Live parameters: Profit-Trim AER {trim_aer:.2f}x · Vol Stop-Loss {stop_mult:.1f}x · "
              f"Min Trim Size ₹{_inr_indian(min_mv)} · Benchmark XIRR {bench * 100:.0f}% · "
-             f"Monthly SIP Budget ₹{_inr_indian(budget)}_")
+             f"Base Unit SIP ₹{_inr_indian(base_unit_sip)} · Max Monthly Ceiling ₹{_inr_indian(budget)}_")
     L.append("")
     L.append("## 1. Core Philosophy & Monthly Cadence")
     L.append("Once-a-month review (~15 minutes) before deploying the monthly SIPs, using 100% "
@@ -1195,19 +1316,21 @@ def _stage4_playbook_markdown(live: dict) -> str:
              "Adjusted Close prices.")
     L.append("")
     L.append("## 2. New SIP Incubation Gate (Protecting the first SIPs)")
-    L.append(f"Any stock with Invested Cost < ₹{_inr_indian(inc_max)} OR Holding Age < {inc_days} days stays "
+    L.append(f"Any stock with Holding Age < {inc_days} days AND (Invested Cost < ₹{_inr_indian(inc_max)} OR Holding Age < 180 days) stays "
              "in **Incubation Mode**.")
+    L.append("- A stock held over 1 year (365+ days) can NEVER re-enter Incubation Mode — even if partial sells drop its remaining cost below ₹1,00,000 — so old stub positions go through LAGGARD_EXIT / hard-stop evaluation instead of fresh SIPs.")
     L.append("- Locked at **1.0x** base SIP for rupee-cost averaging; profit trims & laggard exits are suppressed.")
     L.append(f"- Protected solely by a **{int((1 - inc_gtt) * 100)}% Catastrophe Circuit Breaker** "
              f"(Avg Buy Price × {inc_gtt:.2f}).")
     L.append("")
-    L.append("## 3. Monthly SIP Deployment - 4-Lane Guide (Rs 5,000 units)")
-    L.append("All-weather discipline (never chase vertical peaks). Each stock lands in one lane from its 200-DMA distance and AER:")
-    L.append("- **Lane 1 (2.5x Resting Winner)** - 0% to +15% above 200-DMA, XIRR > Bench + 10%, AER < 1.30: double up on proven winners resting (cap Rs 35,000).")
-    L.append("- **Lane 2 (1.0x Cruising / Incubating)** - 0% to +30% above 200-DMA, 0.85 <= AER < 1.35: steady accumulation (Incubating locked 1.0x).")
-    L.append("- **Lane 3 (0.0x Overheated Rocket)** - more than +30% above 200-DMA OR AER >= 1.35: stop fresh money, keep shares compounding. Not a warning.")
+    L.append(f"## 3. Monthly SIP Deployment - Bottom-Up Conviction Sizing (Base Unit SIP Rs {_inr_indian(base_unit_sip)})")
+    L.append("All-weather discipline (never chase vertical peaks). Each stock lands in one lane from its 200-DMA distance and AER. SIPs are sized bottom-up; the monthly budget is a MAXIMUM ceiling, not a target:")
+    L.append(f"- **Lane 1 (2.5x Resting Winner)** - 0% to +15% above 200-DMA, XIRR > Bench + 10%, AER < 1.25: double up on proven winners resting -> Rs {_inr_indian(base_unit_sip * 2.5)}.")
+    L.append(f"- **Lane 2 (1.0x Cruising / Incubating Healthy)** - 0% to +30% above 200-DMA, 0.85 <= AER < 1.25: steady accumulation -> Rs {_inr_indian(base_unit_sip)}.")
+    L.append(f"- **Lane 2b (0.5x Incubating - Below 200-DMA or >+30% Run-Up)** - trend not confirmed -> Rs {_inr_indian(base_unit_sip * 0.5)}.")
+    L.append("- **Lane 3 (0.0x Overheated Rocket)** - more than +30% above 200-DMA OR AER >= 1.25: stop fresh money, keep shares compounding. Not a warning.")
     L.append("- **Lane 4 (0.0x Broken Trend)** - below 200-DMA OR AER < 0.85: freeze SIPs, verify GTT, exit 100% only on GTT or AER <= 0.50.")
-    L.append("Every SIP is an exact Rs 5,000 multiple and capped at Rs 35,000 per stock; leftover parks in Liquid Fund / Dry Powder; sub-Rs 5,000 shows as Carry-Forward Cash.")
+    L.append("**Ceiling, not a target:** if fewer stocks qualify, your natural total drops (e.g. Rs 1,05,000) and the unspent balance stays in cash. Only if the natural total exceeds the ceiling do we scale down graduated stocks proportionally. Every SIP is an exact Rs 5,000 multiple, capped at Rs 35,000 per stock.")
     L.append("## 4. The 4-Tier Sell & Profit-Booking Ladder (Priority Order)")
     L.append(f"**Priority 1 — Hard Volatility Stop-Loss (100% Exit):** Invested ≥ ₹1,50,000 AND "
              f"(CMP ≤ Avg Buy × (1 − StopLoss%) where StopLoss% = clamp({stop_mult:.1f}×AnnualVol, 20%, 45%), "
@@ -1239,17 +1362,20 @@ def _stage4_playbook_markdown(live: dict) -> str:
              "(business is compounding; valuation is just cooling off).")
     L.append("- **Exit 100% & Reallocate:** Quarterly YoY Revenue/Profit growth stalled < 10% for 2 consecutive quarters.")
     L.append("- **Tax-Loss Harvesting Bonus:** Prefer exiting stagnant laggards sitting at a loss during Feb–March "
-             "to offset realized LTCG/STCG taxes from AER ≥ 1.50x profit trims.")
+             "to offset realized LTCG/STCG taxes from AER ≥ 1.85x profit trims.")
     L.append("")
     L.append("## 7. Staggered Cash Redeployment Playbook")
     L.append("Deploy cash freed up from HARD_STOP_LOSS, CONCENTRATION_TRIM, or LAGGARD_EXIT:")
     L.append("1. **No Lump-Sum Chasing:** Park net proceeds immediately in a Liquid Fund / LIQUIDBEES.")
-    L.append("2. **Stagger Over 3–6 Monthly SIPs:** Divide the harvested cash pool into 3 equal monthly "
-             "tranches (if < ₹3,00,000) or 6 tranches (if ≥ ₹3,00,000) and feed them into the Stage 4C "
-             f"Monthly SIP Budget (₹{_inr_indian(budget)}) so 2.5x winners absorb capital gradually without "
-             "distorting AER cost weights.")
-    L.append("3. **New Replacement Exception:** Up to ₹50,000 starter deployment + ₹10,000 monthly SIPs "
-             "until reaching the ₹1,00,000 incubation graduation mark.")
+    L.append(f"2. **Expand the Max Monthly Ceiling:** Harvested cash from trims/exits increases your Max Monthly Budget Ceiling (currently \u20b9{_inr_indian(budget)}) so active Lane 1 (2.5x) winners keep compounding and new incubating starters - Lane 2 (\u20b910,000 healthy) or Lane 2b (\u20b95,000 below-200-DMA / >+30% run-up) - receive their full tranche.")
+    L.append("3. **SIP-First Deployment:** Route the enlarged ceiling into bottom-up conviction SIPs first; only deploy residual cash above the ceiling as lump sum into Liquid Fund / LIQUIDBEES.")
+    L.append("4. **New Replacement Exception:** Up to \u20b950,000 starter deployment + \u20b910,000 monthly SIPs until reaching the \u20b91,00,000 incubation graduation mark.")
+    L.append("5. **Permanent Lockout vs Trend-Reclaim Re-Entry:** After a **HARD_STOP_LOSS** (GTT trigger or AER \u2264 0.50) the stock is **permanently locked out** \u2014 never re-entered for the rest of the simulation, mirroring real-life discipline on broken stories (e.g. Yes Bank, PI Industries). Only a **LAGGARD_EXIT** (90-day cooling-off) may reopen \u2014 and only on a confirmed Golden-Cross uptrend reclaim (**CMP > 200-DMA AND 50-DMA > 200-DMA**), never merely on price alone.")
+    L.append("")
+    L.append("6. **3-Month Staggered Redeployment:** Redeploy post-sale proceeds into eligible Lane 1 (2.5x) / Lane 2 (1.0x) uptrending stocks in 3 equal monthly tranches over 3 months, respecting the Rs 2,00,000 monthly ceiling and cash >= 0.")
+    L.append("")
+    L.append("## 8. Exclusions & Watchlist Hygiene")
+    L.append("Toggle non-equity holdings (e.g. NCDs) and stocks marked for exit to **Excluded** in Stage 4C. Excluded stocks receive \u20b90 SIP, are removed from the equity AER denominator, and keep their historical XIRR intact.")
     L.append("")
     L.append("_Tax refs: LTCG 12.5% above ₹1.25L annual exemption; STCG 20%. Advisory only — verify with your CA._")
     return "\n".join(L)
@@ -1284,6 +1410,7 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
             "min_mv": float(st.session_state.get("s4_min_mv", s4.TRIM_MIN_MARKET_VALUE)),
             "bench_xirr": float(st.session_state.get("s4_bench_xirr", 0.12)),
             "budget": float(st.session_state.get("s4c_budget", s4.DEFAULT_MONTHLY_SIP_BUDGET)),
+            "base_unit_sip": float(st.session_state.get("s4c_base_unit_sip", s4.BASE_UNIT_SIP)),
             "inc_max": float(s4.INCUBATION_MAX_INVESTED),
             "inc_days": int(s4.INCUBATION_MAX_DAYS),
             "inc_gtt": float(s4.INCUBATION_GTT_MULT),
@@ -1366,12 +1493,11 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
     # ---- prioritized action cards ----------------------------------------
     st.markdown("**Prioritized Sell & Trim Actions**")
     action_rows = [r for r in rows if r["signal_type"] in (
-        s4.HARD_STOP_LOSS, s4.TREND_BREAK_LOCK, s4.CONCENTRATION_TRIM)]
+        s4.HARD_STOP_LOSS, s4.CONCENTRATION_TRIM)]
     action_rows.sort(key=lambda r: r["priority"])
     if not action_rows:
         st.success("No sell / trim actions triggered under the current thresholds.")
     accents = {s4.HARD_STOP_LOSS: ("🔴", "#d64545"),
-               s4.TREND_BREAK_LOCK: ("🟠", "#d98b00"),
                s4.CONCENTRATION_TRIM: ("🔵", "#1c7ed6")}
     for r in action_rows:
         sid = r["security_id"]
@@ -1387,10 +1513,6 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
             why = ("Volatility Stop-Loss breached" if "stop-loss" in (r.get("reason") or "")
                    else "AER collapsed to 0.50x or below")
             action = f"Exit 100% ({shares} shares, {inr(shares * cmp_)}) — {why}"
-        elif sig == s4.TREND_BREAK_LOCK:
-            shares = int(qty // 2)
-            action = (f"Sell 50% ({shares} shares, {inr(shares * cmp_)}) — price broke below "
-                      "50-DMA while AER >= 1.30")
         else:
             shares = int(r.get("shares_to_sell") or 0)
             from_w = (r.get("market_weight_pct") or 0.0) * 100.0
@@ -1470,6 +1592,73 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
         st.caption("Reallocation candidates: held > 1 year, Efficiency Score < 0 and price below 200-DMA.")
 
 
+def _rehydrate_incubation_entries(ctx: AppContext, as_of) -> dict:
+    """Rebuild the incubation entries from the persisted watchlist table.
+
+    The DB is the source of truth, so a browser refresh (which clears
+    ``session_state``) still shows every saved watchlist stock. Signals are
+    recomputed from the unified price series so ISIN- and ticker-keyed prices
+    both resolve to the same data.
+    """
+    from market_data.prices import get_stock_prices_unified, normalize_security_id
+    from market_data.repository import MarketDataStore
+    from performance import stage4_signals as s4
+
+    entries: dict = {}
+    try:
+        store = MarketDataStore(ctx.market_db_path)
+        rows = store.get_watchlist_stocks()
+    except Exception:  # noqa: BLE001
+        return entries
+
+    cutoff = str(as_of)[:10]
+    for row in rows:
+        ticker = str(row.get("nse_ticker") or row.get("isin") or "").strip().upper()
+        if not ticker:
+            continue
+        ident = normalize_security_id(row.get("isin") or ticker, db_path=ctx.market_db_path)
+        isin = row.get("isin") or ident.get("isin")
+        base = {"id": row.get("id"), "ticker": ticker, "isin": isin, "name": row.get("company_name")}
+        try:
+            pairs = get_stock_prices_unified(ticker, None, cutoff, db_path=ctx.market_db_path)
+        except Exception:  # noqa: BLE001
+            pairs = []
+        if not pairs:
+            base.update({
+                "cmp": row.get("manual_cmp"), "annual_volatility": None,
+                "dma200_distance_pct": None, "is_golden_cross": False,
+                "starter_sip": 5000.0, "tier": "C",
+                "reason": "Price history not imported yet.", "invested_cost": 0.0, "missing": True,
+            })
+            entries[ticker] = base
+            continue
+        series = [c for _, c in pairs]
+        dates = [d for d, _ in pairs]
+        try:
+            si = s4.StockInput(security_id=ticker, symbol=ticker, quantity=0.0, avg_buy_price=0.0,
+                               invested_cost=0.0, market_value=0.0, xirr=0.0,
+                               holding_start_date=as_of, price_series=series, price_dates=dates)
+            m = s4.analyzeStockSignals(
+                si, s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0), 0.12)
+            starter = s4.incubation_starter_sip(m)
+            base.update({
+                "cmp": m.get("cmp") or series[-1],
+                "annual_volatility": m.get("annual_volatility"),
+                "dma200_distance_pct": m.get("dma200_distance_pct"),
+                "is_golden_cross": bool(m.get("is_golden_cross")),
+                "starter_sip": float(starter["sip"]), "tier": starter["tier"],
+                "reason": starter["reason"], "invested_cost": 0.0,
+            })
+        except Exception:  # noqa: BLE001
+            base.update({
+                "cmp": series[-1], "annual_volatility": None, "dma200_distance_pct": None,
+                "is_golden_cross": False, "starter_sip": 5000.0, "tier": "C",
+                "reason": "Signal computation failed.", "invested_cost": 0.0,
+            })
+        entries[ticker] = base
+    return entries
+
+
 def _render_stage4_planner(ctx: AppContext) -> None:
     """Stage 4C - Monthly SIP Deployment, Warning Level & GTT Protection Planner."""
     from datetime import date as _d
@@ -1484,19 +1673,27 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         st.info("No equity transactions available.")
         return
 
-    c1, c2, c3 = st.columns([2, 1, 1])
+    c0, c1, c2, c3 = st.columns([1.2, 2, 1, 1])
+    with c0:
+        base_unit_sip = st.number_input("Base Unit SIP (Rs)", min_value=5000, max_value=100000,
+                                        value=int(s4.BASE_UNIT_SIP), step=5000, key="s4c_base_unit_sip",
+                                        help="Natural lane SIP: 2.5x = 2.5x base, 1.0x = base, 0.5x = half base.")
     with c1:
-        budget = st.number_input("Total Monthly SIP Budget (Rs)", min_value=0, max_value=50000000,
-                                 value=int(s4.DEFAULT_MONTHLY_SIP_BUDGET), step=25000, key="s4c_budget")
+        budget = st.number_input("Max Monthly Budget Ceiling (Rs)", min_value=0, max_value=50000000,
+                                 value=int(s4.DEFAULT_MONTHLY_SIP_BUDGET), step=25000, key="s4c_budget",
+                                 help="MAXIMUM ceiling, not a target. If fewer stocks qualify the total SIP drops and the rest stays in cash.")
     with c2:
         include_harvest = st.checkbox("Include Harvested Cash (Stage 4B trims)", value=False,
                                       key="s4c_harvest")
     with c3:
         max_single_stock_sip = st.number_input("Max Single-Stock SIP (Rs)", min_value=0, max_value=500000, value=int(s4.MAX_SINGLE_STOCK_SIP), step=5000, key="s4c_max_sip", help="Cap each stock monthly SIP; leftover parks in Liquid Fund.")
     max_single_stock_sip = float(max_single_stock_sip)
+    base_unit_sip = float(base_unit_sip)
 
     as_of = f.end_date or _d.today()
     px = s4.make_adjusted_close_lookup(ctx.market_db_path)
+    # Persistent watchlist: rebuild entries from the DB so a page refresh keeps them.
+    st.session_state["s4c_incubation_entries"] = _rehydrate_incubation_entries(ctx, as_of)
 
     active_isins = []
     try:
@@ -1512,9 +1709,13 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         st.info("No active equity holdings to plan for.")
         return
 
+    if "s4c_excluded_tickers" not in st.session_state:
+        st.session_state["s4c_excluded_tickers"] = set()
+    _excluded_now = set(st.session_state["s4c_excluded_tickers"])
     key = ("s4c_rows", tx_hash(txs), str(as_of)[:10], getattr(f, "person_id", None),
            len(ctx.opening_positions or []), round(max_single_stock_sip, 4),
-           len(st.session_state.get("s4c_incubation_entries", {})))
+           len(st.session_state.get("s4c_incubation_entries", {})),
+           tuple(sorted(_excluded_now)))
     cached = st.session_state.get(key)
     if cached is None:
         with st.spinner("Building this month's SIP plan over Adjusted-Close history..."):
@@ -1527,7 +1728,8 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 except Exception:  # noqa: BLE001, S112
                     continue
             totals = s4.build_portfolio_totals(stocks)
-            rows = s4.evaluate_signals(stocks, totals, 0.12, as_of_date=as_of)
+            rows = s4.evaluate_signals(stocks, totals, 0.12, as_of_date=as_of,
+                                       excluded_tickers=_excluded_now)
             by_id = {s.security_id: s for s in stocks}
             for r in rows:
                 s = by_id.get(r["security_id"])
@@ -1561,9 +1763,13 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                                          opening_positions=ctx.opening_positions)
                 harvested += float(tp["net_cash_unlocked"])
 
-    _inc_total_early = sum(float(e.get("starter_sip", 0.0)) for e in st.session_state.get("s4c_incubation_entries", {}).values())
-    _effective_budget = max(0.0, float(budget) - _inc_total_early)
-    alloc = s4.compute_monthly_sip_allocation(rows, _effective_budget, harvested_cash=harvested, max_single_stock_sip=max_single_stock_sip)
+    _inc_entries_list = list(st.session_state.get("s4c_incubation_entries", {}).values())
+    alloc = s4.compute_bottom_up_sip_allocation(
+        rows, _inc_entries_list,
+        base_unit_sip=base_unit_sip,
+        max_budget_ceiling=float(budget),
+        max_single_stock_sip=max_single_stock_sip,
+    )
     arows = sorted(alloc["rows"], key=lambda r: -float(r.get("sip_multiplier") or 0))
     deploy = float(alloc["deployable_budget"])
     active_buy = sum(1 for r in arows if float(r.get("sip_multiplier") or 0) > 0)
@@ -1571,14 +1777,22 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     near_gtt = sum(1 for r in arows
                    if r.get("gtt_buffer_pct") is not None and r["gtt_buffer_pct"] <= s4.GTT_BUFFER_WARN)
 
-    allocated = float(alloc.get("total_allocated", deploy)) + _inc_total_early
-    parked = float(alloc.get("parked_cash", 0.0))
+    allocated = float(alloc.get("total_allocated", deploy))
+    parked = float(alloc.get("parked_cash", 0.0)) + float(harvested)
     k = st.columns(5)
-    k[0].metric("Total Monthly Deployment (incl. Incubation)", inr(allocated))
-    k[1].metric("Park in Liquid Fund / Dry Powder", inr(parked))
+    k[0].metric("Total Monthly SIP (Bottom-Up)", inr(allocated))
+    k[1].metric("Unspent / Liquid Reserve (Ceiling - SIP)", inr(parked))
     k[2].metric("Active Buy Positions", str(active_buy))
     k[3].metric("Warning / Frozen (0.0x)", str(warn_count))
     k[4].metric("Near GTT Stop Alerts", str(near_gtt))
+    if alloc.get("scaled_down"):
+        st.info("Bottom-up natural SIP total " + inr(alloc.get("natural_total_sip", 0.0))
+                + " exceeds the ceiling " + inr(deploy)
+                + " - graduated stocks scaled down proportionally (Rs 5k multiples).")
+    else:
+        st.caption("Natural lane SIPs total " + inr(alloc.get("natural_total_sip", allocated))
+                   + ". Ceiling is a maximum, not a target - " + inr(parked)
+                   + " kept as Liquid Reserve.")
     if harvested > 0:
         st.caption("Includes " + inr(harvested) + " harvested cash from Stage 4B profit-booking.")
     if alloc.get("carry_forward_cash"):
@@ -1594,6 +1808,28 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 "governance / sector red flags.")
 
     # ---- Smart New-Stock Entry & Incubation Pacing (Stage 4C enhancement) ---------------------
+    def _import_inc_price(_query, start, end):
+        """Fetch + persist prices under the canonical NSE ticker (ISIN-aware)."""
+        from market_data.prices import (
+            fetch_stock_prices,
+            link_symbol_mapping,
+            normalize_security_id,
+        )
+
+        ident = normalize_security_id(_query, db_path=ctx.market_db_path)
+        ticker = ident.get("nse_ticker") or ident.get("canonical") or str(_query).strip().upper()
+        isin = ident.get("isin")
+        if not ticker:
+            return {"ok": False, "fetched": 0, "error": "could not determine an NSE ticker"}
+        if isin and ticker:
+            link_symbol_mapping(isin, ticker, db_path=ctx.market_db_path)
+        _res = fetch_stock_prices(ticker, start=str(start)[:10], end=str(end)[:10],
+                                  db_path=ctx.market_db_path, symbol=ticker, persist=True)
+        _n = int(_res.get("rows_fetched") or 0)
+        _errs = _res.get("errors") or []
+        return {"ok": _n > 0, "fetched": _n, "symbol": ticker, "ticker": ticker, "isin": isin,
+                "error": (None if _n > 0 else ("; ".join(str(e) for e in _errs) or "no rows returned"))}
+
     if "s4c_incubation_entries" not in st.session_state:
         st.session_state["s4c_incubation_entries"] = {}
     inc_entries: dict = st.session_state["s4c_incubation_entries"]
@@ -1601,8 +1837,9 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     st.markdown("**+ Simulate New Stock Entry** (incubation pacing planner)")
     _c1, _c2, _c3 = st.columns([3, 1, 1])
     with _c1:
-        _new_tk = st.text_input("NSE Ticker", value="", key="s4c_new_ticker",
-                                help="e.g. SJS.NS, ZENTEC.NS, RADICO.NS, ARROWGREEN.NS, DRAGARWQ.NS")
+        _new_tk = st.text_input("ISIN or NSE Ticker", value="", key="s4c_new_ticker",
+                                help="Enter an ISIN (e.g. INE192B01031) or a ticker (SJS or SJS.NS). "
+                                     "ISIN and ticker resolve to the same price history.")
     with _c2:
         _add_tk = st.button("Add to Incubation", key="s4c_add_ticker")
     with _c3:
@@ -1610,23 +1847,51 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                                key="s4c_rem_ticker") if inc_entries else st.selectbox("Remove", ["(none)"],
                                                                                      key="s4c_rem_ticker_empty",
                                                                                      disabled=True)
-    if _add_tk and _new_tk:
-        _sid = str(_new_tk).strip().upper()
+    _pending_add = st.session_state.pop("s4c_inc_pending_add", None)
+    _add_query = (str(_new_tk).strip().upper() if (_add_tk and _new_tk) else "") or (_pending_add or "")
+    if _add_query:
+        from market_data.prices import (
+            get_stock_prices_unified,
+            link_symbol_mapping,
+            normalize_security_id,
+            resolve_company_name,
+        )
+        from market_data.repository import MarketDataStore
+        _ident = normalize_security_id(_add_query, db_path=ctx.market_db_path)
+        _ticker = (_ident.get("nse_ticker") or _ident.get("canonical") or _add_query).strip().upper()
+        _isin = _ident.get("isin")
         try:
-            _series = px.series(_sid, as_of) if hasattr(px, "series") else []
-            if not _series:
-                st.error(f"No price history found for {_sid} up to {as_of}.")
+            _pairs = get_stock_prices_unified(_ticker, None, str(as_of)[:10], db_path=ctx.market_db_path)
+            if not _pairs:
+                _inc_start = f.start_date or _d.fromordinal(as_of.toordinal() - 730)
+                st.session_state["s4c_inc_missing"] = {
+                    "query": _add_query, "ticker": _ticker, "isin": _isin,
+                    "start": str(_inc_start)[:10], "end": str(as_of)[:10],
+                }
+                st.error(f"No price history found for {_ticker} up to {as_of}. Import it below to add it to incubation.")
             else:
-                _si = s4.StockInput(security_id=_sid, symbol=_sid, quantity=0.0,
+                st.session_state.pop("s4c_inc_missing", None)
+                _series = [c for _, c in _pairs]
+                _dates = [d for d, _ in _pairs]
+                _si = s4.StockInput(security_id=_ticker, symbol=_ticker, quantity=0.0,
                                     avg_buy_price=0.0, invested_cost=0.0, market_value=0.0,
                                     xirr=0.0, holding_start_date=as_of, price_series=_series,
-                                    price_dates=_series)
+                                    price_dates=_dates)
                 _tot = s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0)
                 _m = s4.analyzeStockSignals(_si, _tot, 0.12)
                 _starter = s4.incubation_starter_sip(_m)
-                inc_entries[_sid] = {
-                    "ticker": _sid,
-                    "cmp": _m.get("cmp") or _series[-1],
+                _cmp = _m.get("cmp") or _series[-1]
+                _company = resolve_company_name(_ticker, nse_ticker=_ticker, db_path=ctx.market_db_path)
+                if _isin and _ticker:
+                    link_symbol_mapping(_isin, _ticker, db_path=ctx.market_db_path)
+                _row_id = MarketDataStore(ctx.market_db_path).add_watchlist_stock(
+                    isin=_isin, nse_ticker=_ticker, company_name=_company, manual_cmp=_cmp)
+                inc_entries[_ticker] = {
+                    "id": _row_id,
+                    "ticker": _ticker,
+                    "isin": _isin,
+                    "name": _company,
+                    "cmp": _cmp,
                     "annual_volatility": _m.get("annual_volatility"),
                     "dma200_distance_pct": _m.get("dma200_distance_pct"),
                     "is_golden_cross": bool(_m.get("is_golden_cross")),
@@ -1638,11 +1903,42 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 st.session_state["s4c_incubation_entries"] = inc_entries
                 st.rerun()
         except Exception as _e:  # noqa: BLE001
-            st.error(f"Could not simulate {_sid}: {_e}")
+            st.error(f"Could not simulate {_ticker}: {_e}")
     if _rem_tk != "(none)" and _rem_tk in inc_entries:
-        del inc_entries[_rem_tk]
+        try:
+            from market_data.repository import MarketDataStore
+            MarketDataStore(ctx.market_db_path).delete_watchlist_stock(
+                stock_id=inc_entries.get(_rem_tk, {}).get("id"), nse_ticker=_rem_tk)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        inc_entries.pop(_rem_tk, None)
         st.session_state["s4c_incubation_entries"] = inc_entries
         st.rerun()
+
+    _inc_miss = st.session_state.get("s4c_inc_missing")
+    if _inc_miss:
+        _inc_label = _inc_miss.get("ticker") or _inc_miss.get("query") or _inc_miss.get("sid")
+        _inc_query = _inc_miss.get("query") or _inc_miss.get("sid") or _inc_label
+        st.warning(f"Price history is missing for {_inc_label} ({_inc_miss['start']} to {_inc_miss['end']}). "
+                   "Import it to add this stock to the incubation pacing table.")
+        _imp_col, _can_col = st.columns([3, 1])
+        with _imp_col:
+            if st.button(f"Import price history & add {_inc_label}",
+                         key="s4c_inc_import", type="primary"):
+                with st.spinner(f"Fetching price history for {_inc_label}..."):
+                    _imp = _import_inc_price(_inc_query, _inc_miss["start"], _inc_miss["end"])
+                if not _imp["ok"]:
+                    st.error(f"Could not import price history for {_inc_label}: "
+                             f"{_imp.get('error') or 'unknown error'}. You can add a symbol mapping in "
+                             "Data & Settings, then retry.")
+                else:
+                    st.session_state["s4c_inc_pending_add"] = _inc_query
+                    st.session_state.pop("s4c_inc_missing", None)
+                    st.rerun()
+        with _can_col:
+            if st.button("Cancel", key="s4c_inc_import_cancel"):
+                st.session_state.pop("s4c_inc_missing", None)
+                st.rerun()
 
     incubation_total = 0.0
     inc_rows = []
@@ -1660,8 +1956,12 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 "B": "⚖️ Standard ₹10k",
                 "C": "🛡️ Toe-Hold ₹5k",
             }.get(_e["tier"], _e["tier"])
+            _resolved = _e.get("name") or _name(_tk)
+            _company = _resolved if (_resolved and _resolved != _tk) else None
+            _isin_disp = _e.get("isin") or ""
             inc_rows.append({
-                "Ticker": _tk,
+                "Stock": _company or _tk,
+                "ISIN · NSE Ticker": (f"{_isin_disp} · {_tk}" if _isin_disp else _tk),
                 "CMP": f"{_e['cmp']:,.1f}" if _e.get("cmp") else "N/A",
                 "Vol %": f"{_vol * 100:.1f}%" if _vol is not None else "N/A",
                 "200-DMA Dist %": f"{_dist * 100:+.1f}%" if _dist is not None else "N/A",
@@ -1699,6 +1999,21 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         return "N/A"
 
     st.markdown("**Monthly Execution Table**")
+    _all_tickers = [r["security_id"] for r in arows]
+    _label_of = {t: f'{_name(t)} ({t})' for t in _all_tickers}
+    _label_to_ticker = {v: k for k, v in _label_of.items()}
+    _default_excl = [_label_of[t] for t in _all_tickers if t in _excluded_now]
+    _picked = st.multiselect(
+        "Exclude from strategy (force SIP to Rs 0)",
+        options=[_label_of[t] for t in _all_tickers],
+        default=_default_excl,
+        key="s4c_exclude_picker",
+        help="Excluded stocks are dropped from the SIP pool (SIP = Rs 0) and flagged EXCLUDED - DO NOT BUY.",
+    )
+    _picked_tickers = {_label_to_ticker[lbl] for lbl in _picked if lbl in _label_to_ticker}
+    if _picked_tickers != set(_excluded_now):
+        st.session_state["s4c_excluded_tickers"] = _picked_tickers
+        st.rerun()
     disp_rows = []
     amber_flags = []
     csv_rows = []
@@ -1787,35 +2102,499 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                        file_name="monthly_sip_gtt_plan.csv", mime="text/csv", key="s4c_csv")
 
 
+@st.cache_data(show_spinner="Running walk-forward backtest...")
+def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
+                                trim_aer=1.85, trim_target_mult=1.40):
+    """Cached wrapper around run_backtest() (module-level so st.cache_data persists)."""
+    import json
+
+    import pandas as pd
+
+    from performance.stage4_backtest import BacktestConfig, run_backtest
+
+    cfg = BacktestConfig(
+        years=int(years_val),
+        include_watchlist=bool(include_wl),
+        include_closed_positions=bool(include_closed),
+        base_unit_sip=10000.0,
+        max_monthly_ceiling=200000.0,
+        trim_aer=float(trim_aer),
+        trim_target_mult=float(trim_target_mult),
+        market_db_path=md_path,
+    )
+    txs_loaded = json.loads(txs_json) if txs_json else []
+    holdings_loaded = None
+    if holdings_json:
+        try:
+            holdings_loaded = pd.DataFrame(json.loads(holdings_json))
+        except Exception:  # noqa: BLE001
+            holdings_loaded = None
+    return run_backtest(cfg, txs=txs_loaded, holdings=holdings_loaded)
+
+
+def _render_stage4_backtester(ctx: AppContext) -> None:
+    """Stage 4E - Strategy Backtester UI (3Y / 5Y / 7Y).
+
+    Calls run_backtest() from performance.stage4_backtest directly (via a
+    cache_data wrapper) so toggling filters / timeframe feels instantaneous.
+    """
+    import json
+    from datetime import date as _d
+
+    import pandas as pd
+    import plotly.graph_objects as go
+
+    from performance import backtest_data as bd
+
+    st.markdown("#### Strategy Backtester (3Y / 5Y / 7Y)")
+    st.caption(
+        "Walk-forward simulation over the local 8-year price cache. "
+        "Zero look-ahead bias; advisory only - nothing is executed."
+    )
+
+    c1, c2, c3, c4, c5 = st.columns([1.4, 1.7, 1.7, 1.8, 1.0])
+    with c1:
+        years = st.radio(
+            "Timeframe", [3, 5, 7], index=2, horizontal=True, key="s4e_years",
+            help="Backtest window (3 / 5 / 7 years).",
+        )
+    with c2:
+        compare_wl = st.checkbox(
+            "Compare With Planned Watchlist Additions", value=False, key="s4e_compare_wl",
+            help="Run side-by-side with and without saved watchlist_stocks.",
+        )
+    with c3:
+        include_closed = st.checkbox(
+            "Include My Sold-Off / Closed Positions", value=True, key="s4e_include_closed",
+            help="Include closed historical positions (net_qty == 0) such as YESBANK.NS.",
+        )
+    with c4:
+        compare_trim = st.checkbox(
+            "Compare 1.85x vs. 2.25x AER Trim", value=True, key="s4e_compare_trim",
+            help="Run the 1.85x (1.40x reset) and 2.25x (1.60x reset) concentration-trim rules side-by-side.",
+        )
+    with c5:
+        run_btn = st.button(
+            "Run Backtest", key="s4e_run", type="primary", use_container_width=True,
+        )
+
+    if not run_btn:
+        st.info("Configure the controls above and click **Run Backtest** to simulate.")
+        return
+
+    txs = ctx.txs
+    holdings = ctx.holdings
+    market_db = ctx.market_db_path
+    if not txs:
+        st.info("No equity transactions available.")
+        return
+
+    txs_json = json.dumps(txs, sort_keys=True, default=str)
+    holdings_json = None
+    if holdings is not None:
+        try:
+            holdings_json = json.dumps(holdings.to_dict("records"), sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            holdings_json = None
+
+    with st.spinner("Simulating base portfolio..."):
+        try:
+            res_main = _run_stage4_backtest_cached(
+                int(years), False, include_closed, market_db, txs_json, holdings_json)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Backtest unavailable: {e}")
+            return
+
+    res_225 = None
+    if compare_trim:
+        with st.spinner("Simulating 2.25x AER trim configuration..."):
+            try:
+                res_225 = _run_stage4_backtest_cached(
+                    int(years), False, include_closed, market_db, txs_json, holdings_json,
+                    trim_aer=2.25, trim_target_mult=1.60)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"2.25x trim comparison unavailable: {e}")
+
+    res_wl = None
+    if compare_wl:
+        with st.spinner("Simulating with watchlist additions..."):
+            try:
+                res_wl = _run_stage4_backtest_cached(
+                    int(years), True, include_closed, market_db, txs_json, holdings_json)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Watchlist comparison unavailable: {e}")
+
+    skipped = res_main.get("universe", {}).get("skipped_tickers", [])
+    if skipped:
+        st.caption("Skipped (delisted / no data): " + ", ".join(skipped))
+
+    def _benchmark_series(ticker, flows, all_dates):
+        """Daily index value from matched cashflows (local DB only)."""
+        if not ticker:
+            return []
+        rows = bd.cached_price_series(ticker, market_db_path=market_db)
+        price_map = {}
+        for dd, pp in rows:
+            try:
+                price_map[_d.fromisoformat(str(dd)[:10])] = float(pp)
+            except Exception:  # noqa: BLE001, S112
+                continue
+        units = 0.0
+        out = []
+        cf_idx = 0
+        cfs = sorted(flows, key=lambda x: x[0])
+        for d in all_dates:
+            while cf_idx < len(cfs) and cfs[cf_idx][0] <= d:
+                _, amt = cfs[cf_idx]
+                px = price_map.get(d)
+                if px and px > 0 and amt < 0:
+                    units += (-amt) / px
+                cf_idx += 1
+            px = price_map.get(d)
+            out.append((d, units * px if px else None))
+        return out
+
+    daily = res_main.get("daily_curve", [])
+    port_dates = [_d.fromisoformat(r["date"]) for r in daily]
+    port_values = [r["value"] for r in daily]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=port_dates, y=port_values,
+            name=("Stage 4 (1.85x Trim)" if res_225 else "Stage 4 Engine (Post-Tax)"),
+            line={"width": 2, "color": "#1f77b4"},
+        )
+    )
+
+    if res_225:
+        d225 = res_225.get("daily_curve", [])
+        fig.add_trace(
+            go.Scatter(
+                x=[_d.fromisoformat(r["date"]) for r in d225],
+                y=[r["value"] for r in d225],
+                name="Stage 4 (2.25x Trim)",
+                line={"width": 2, "color": "#e377c2", "dash": "dash"},
+            )
+        )
+
+    if res_wl:
+        wl_daily = res_wl.get("daily_curve", [])
+        fig.add_trace(
+            go.Scatter(
+                x=[_d.fromisoformat(r["date"]) for r in wl_daily],
+                y=[r["value"] for r in wl_daily],
+                name="Stage 4 Engine (+Watchlist, Post-Tax)",
+                line={"width": 2, "color": "#ff7f0e", "dash": "dot"},
+            )
+        )
+
+    flows = [(_d.fromisoformat(d), -a) for d, a in res_main.get("cashflows", [])]
+    bench_specs = [
+        ("Equal-Weight Buy & Hold SIP", "equal_weight", "#2ca02c", None),
+        ("Nifty 50 TRI (^NSEI)", "nifty50", "#d62728", bd.NIFTY50_TICKER),
+        ("Nifty 500 TRI (^CRSLDX / MONIFTY500.NS)", "nifty500", "#9467bd", bd.NIFTY500_TICKERS[0]),
+    ]
+    bench_value_series = {}
+    for label, key, color, ticker in bench_specs:
+        b = res_main.get("benchmarks", {}).get(key, {})
+        backend_curve = b.get("daily_curve") or []
+        if backend_curve:
+            series = [(_d.fromisoformat(p["date"]), p["value"])
+                      for p in backend_curve if p.get("value") is not None]
+        else:
+            series = _benchmark_series(ticker, flows, port_dates)
+        bench_value_series[label] = series
+        xs = [d for d, v in series if v is not None]
+        ys = [v for d, v in series if v is not None]
+        if xs:
+            fig.add_trace(
+                go.Scatter(x=xs, y=ys, name=label, line={"width": 2, "color": color, "dash": "dash"})
+            )
+
+    # Cumulative out-of-pocket capital invested (dashed reference line) so gains
+    # above invested principal are immediately visible on the growth chart.
+    cf_pairs = sorted((_d.fromisoformat(d), amt) for d, amt in res_main.get("cashflows", []))
+    cum_capital, cum_values, _ci = 0.0, [], 0
+    for pdate in port_dates:
+        while _ci < len(cf_pairs) and cf_pairs[_ci][0] <= pdate:
+            cum_capital += abs(cf_pairs[_ci][1])
+            _ci += 1
+        cum_values.append(cum_capital)
+    if port_dates:
+        fig.add_trace(
+            go.Scatter(
+                x=port_dates, y=cum_values,
+                name="Cumulative Capital Invested",
+                line={"width": 2, "color": "#7f7f7f", "dash": "dash"},
+            )
+        )
+
+    fig.update_layout(
+        title="Portfolio Value Over Time - Strategy vs Benchmarks",
+        xaxis_title="Date",
+        yaxis_title="Portfolio Value (INR)",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+        hovermode="x unified",
+        template="plotly_white",
+        height=460,
+        margin={"l": 10, "r": 10, "t": 60, "b": 10},
+    )
+    fig.update_yaxes(tickprefix="INR ")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("#### Comparison Scorecard")
+    sc_rows = []
+
+    def _pick(sc, bench, key):
+        val = sc.get(key)
+        return bench.get(key) if val is None else val
+
+    def _sc_row(label, res, bench=None):
+        sc = res.get("scorecard", {}) if res else {}
+        b = bench or {}
+        invested = sc.get("invested")
+        if invested is None:
+            invested = b.get("invested")
+        final = sc.get("final_net_value")
+        if final is None:
+            final = b.get("final_value")
+        # Real Ledger carries net_invested (= gross buys - realized sells); all
+        # simulated rows have no realized sells, so net invested == gross invested.
+        net_invested = b.get("net_invested")
+        if net_invested is None:
+            net_invested = invested
+        # Realized sells: Stage 4 Engine (sc) reports its own gross sell/trim
+        # proceeds; the Real Ledger/bench rows fall back to their own value (or 0).
+        realized_sells = sc.get("realized_sells")
+        if realized_sells is None:
+            realized_sells = b.get("realized_sells", 0.0) or 0.0
+        return {
+            "Strategy / Benchmark": label,
+            "Net Invested Capital (INR)": _fmt_inr(net_invested or 0.0),
+            "Realized Sells (INR)": _fmt_inr(realized_sells),
+            "Final Net Value (INR)": _fmt_inr(final or 0.0),
+            "Post-Tax XIRR (%)": _fmt_pct(_pick(sc, b, "post_tax_xirr_pct")),
+            "Pre-Tax XIRR (%)": _fmt_pct(_pick(sc, b, "pre_tax_xirr_pct")),
+            "Max Drawdown (%)": _fmt_pct(_pick(sc, b, "max_drawdown_pct")),
+            "Return / Drawdown": _fmt_ratio(_pick(sc, b, "return_drawdown_ratio")),
+            "Taxes & Friction (INR)": _fmt_inr(
+                (sc.get("taxes_paid", b.get("taxes_paid", 0.0)) or 0.0)
+                + (sc.get("friction_paid", b.get("friction_paid", 0.0)) or 0.0)),
+            "Sell / Trim Trades": sc.get("trade_count", b.get("trade_count", 0)),
+        }
+
+    sc_rows.append(_sc_row("Stage 4 (1.85x Trim)" if res_225 else "Stage 4 Engine (Current Portfolio)", res_main))
+    if res_225:
+        sc_rows.append(_sc_row("Stage 4 (2.25x Trim)", res_225))
+    if res_wl:
+        sc_rows.append(_sc_row("Stage 4 Engine (+Watchlist)", res_wl))
+    # Reference row: the user's real-life Direct Equity ledger over the same window.
+    period = res_main.get("period") or {}
+    real = _actual_ledger_metrics(
+        ctx.txs, ctx.pl, getattr(ctx, "dividend_flows", None),
+        getattr(ctx, "corporate_actions", None),
+        getattr(ctx, "opening_positions", None),
+        period.get("start"), period.get("end"))
+    if real:
+        sc_rows.append(_sc_row("My Actual Historical Portfolio (Real Ledger)", None, bench=real))
+    for label, key, _c, _t in bench_specs:
+        b = res_main.get("benchmarks", {}).get(key, {})
+        if b:
+            sc_rows.append(_sc_row(label, None, bench=b))
+    ui.safe_dataframe(pd.DataFrame(sc_rows), key="s4e_scorecard")
+    st.caption(
+        "My Actual Historical Portfolio reflects your real-life cashflow timing (actual "
+        "buys / sells / dividends from the ledger). All simulated rows (Stage 4 Engine, "
+        "Equal-Weight Buy & Hold, Nifty 50, Nifty 500) share identical model-driven SIP "
+        "cashflows over the same dates, so their performance is directly comparable."
+    )
+
+    # ---- Year-by-Year Capital & Value Audit Table ---------------------------
+    st.markdown("#### Year-by-Year Capital & Value Audit")
+
+    def _curve_entries(curve):
+        ents = []
+        for r in curve or []:
+            try:
+                ents.append((_d.fromisoformat(str(r["date"])[:10]), r))
+            except Exception:  # noqa: BLE001, S112
+                continue
+        ents.sort(key=lambda x: x[0])
+        return ents
+
+    def _value_at(ents, target, field="value"):
+        val = None
+        for dt, r in ents:
+            if dt <= target:
+                val = r.get(field)
+            else:
+                break
+        return val
+
+    _cf_pairs = sorted((_d.fromisoformat(d), amt) for d, amt in res_main.get("cashflows", []))
+
+    def _cum_capital(target):
+        return sum(abs(a) for dt, a in _cf_pairs if dt <= target)
+
+    main_ents = _curve_entries(res_main.get("daily_curve", []))
+    ew_ents = _curve_entries(res_main.get("benchmarks", {}).get("equal_weight", {}).get("daily_curve", []))
+    n50_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty50", {}).get("daily_curve", []))
+    n500_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty500", {}).get("daily_curve", []))
+    audit_rows = []
+    for yr in sorted({dt.year for dt, _ in main_ents}):
+        year_end = _d(yr, 12, 31)
+        total = _value_at(main_ents, year_end, "value")
+        if total is None:
+            continue
+        cash_res = _value_at(main_ents, year_end, "cash") or 0.0
+        # Year-end snapshot at the last traded day of the year (aligned with the
+        # Dec-31 ordering of the value columns above).
+        year_entries = [(dt, r) for dt, r in main_ents if dt.year == yr]
+        year_end_entry = year_entries[-1][1]
+        audit_rows.append({
+            "Year-End": str(yr),
+            "Cumulative Net Capital Invested (INR)": _fmt_inr(_cum_capital(year_end)),
+            "Stage 4 Active Equity Value (INR)": _fmt_inr((total or 0.0) - cash_res),
+            "Stage 4 Uninvested Cash (INR)": _fmt_inr(cash_res),
+            "Stage 4 Total Net Value (INR)": _fmt_inr(total or 0.0),
+            "Equal-Weight Buy & Hold Value (INR)": _fmt_inr(_value_at(ew_ents, year_end) or 0.0),
+            "Nifty 50 TRI Value (INR)": _fmt_inr(_value_at(n50_ents, year_end) or 0.0),
+            "Nifty 500 TRI Value (INR)": _fmt_inr(_value_at(n500_ents, year_end) or 0.0),
+            "Active Holdings Count": int(year_end_entry.get("holdings_count", 0)),
+            "Eligible Buy Stocks Count": int(year_end_entry.get("eligible_sip_count", 0)),
+        })
+    if audit_rows:
+        ui.safe_dataframe(pd.DataFrame(audit_rows), key="s4e_capital_audit")
+        st.caption(
+            "Capital audit: cumulative net out-of-pocket rupees deployed vs. the ending "
+            "equity, liquid-cash reserve and total net value each calendar year-end, "
+            "alongside the Equal-Weight and Nifty TRI benchmark values (same cashflows)."
+        )
+
+    # ---- Sell Proceeds Breakdown by Trigger Reason (diagnostic) ----------------
+    st.markdown("#### Sell Proceeds Breakdown by Trigger Reason")
+    st.caption(
+        "Exact Trade Count and Gross Proceeds (₹) for each sell trigger, summed across "
+        "the full backtest window. Proceeds are recorded GROSS (before friction & tax) "
+        "so the TOTAL reconciles exactly with the scorecard `realized_sells` figure. "
+        "HARD_STOP_LOSS / LAGGARD_EXIT / CONCENTRATION_TRIM are the strategy rules; "
+        "GTT_STOP_LOSS is the price-based dynamic stop, now evaluated monthly-only on "
+        "the review day (Stage 4 Exp #6). CATASTROPHE_GTT is "
+        "listed for audit completeness and stays at 0 while the blind 45% floor is "
+        "disabled."
+    )
+    sell_breakdown = res_main.get("sell_breakdown") or {}
+    _sell_rows = []
+    for _r in sell_breakdown.get("rows", []):
+        _sell_rows.append({
+            "Sell Trigger": _r.get("reason"),
+            "Trade Count": _r.get("count", 0),
+            "Gross Proceeds (₹)": _fmt_inr(_r.get("gross")),
+        })
+    if _sell_rows:
+        _sell_rows.append({
+            "Sell Trigger": "TOTAL (all triggers)",
+            "Trade Count": sell_breakdown.get("total_trades", 0),
+            "Gross Proceeds (₹)": _fmt_inr(sell_breakdown.get("total_gross_proceeds")),
+        })
+        ui.safe_dataframe(pd.DataFrame(_sell_rows), key="s4e_sell_breakdown")
+        st.caption(
+            "TOTAL gross proceeds reconcile exactly with the scorecard "
+            "`realized_sells`; rows with 0 trades simply never fired in this run."
+        )
+
+    st.markdown("#### Calendar-Year Returns")
+    cy = res_main.get("calendar_year_returns", {})
+    cy_wl = res_wl.get("calendar_year_returns", {}) if res_wl else {}
+
+    def _lead_year(key):
+        m = re.match(r"(\d+)", str(key))
+        return int(m.group(1)) if m else 0
+
+    def _year_index(returns):
+        idx = {}
+        for k in returns:
+            idx.setdefault(_lead_year(k), k)
+        return idx
+
+    cy_index = _year_index(cy)
+    cy_wl_index = _year_index(cy_wl)
+    cy_225 = res_225.get("calendar_year_returns", {}) if res_225 else {}
+    cy_225_index = _year_index(cy_225)
+    bench_cy = {
+        label: res_main.get("benchmarks", {}).get(key, {}).get("calendar_year_returns", {})
+        for label, key, _c, _t in bench_specs
+    }
+    year_set = set(cy_index)
+    for _bcy in bench_cy.values():
+        year_set.update(_year_index(_bcy))
+    all_years = sorted(year_set)
+    if all_years:
+        cy_rows = []
+        for y in all_years:
+            label = cy_index.get(y, str(y))
+            row = {"Year": label, ("Stage 4 (1.85x Trim) (%)" if res_225 else "Stage 4 Engine (%)"): cy.get(label)}
+            if res_225:
+                label_225 = cy_225_index.get(y, label)
+                row["Stage 4 (2.25x Trim) (%)"] = cy_225.get(label_225)
+            if res_wl:
+                wl_label = cy_wl_index.get(y, label)
+                row["Stage 4 Engine (+Watchlist) (%)"] = cy_wl.get(wl_label)
+            for bench_label, bcy in bench_cy.items():
+                bkey = _year_index(bcy).get(y)
+                row[bench_label + " (%)"] = bcy.get(bkey) if bkey is not None else None
+            cy_rows.append(row)
+        ui.safe_dataframe(pd.DataFrame(cy_rows), key="s4e_calendar")
+    else:
+        st.info("Calendar-year returns require cached price coverage across the window.")
+
+    st.markdown("#### Per-Stock Attribution & Closed-Blowup Table")
+    att = res_main.get("attribution", [])
+    if att:
+        att_rows = []
+        for r in att:
+            invested = r.get("invested") or 0.0
+            cur_val = r.get("current_value") or 0.0
+            proceeds = r.get("realized_proceeds") or 0.0
+            total_val = cur_val + proceeds
+            gain = total_val - invested
+            att_rows.append({
+                "Ticker": r.get("ticker"),
+                "Status": r.get("status"),
+                "Total Invested (INR)": round(invested, 2),
+                "Harvested + Ending Value (INR)": round(total_val, 2),
+                "Net Gain/Loss (INR)": round(gain, 2),
+                "Gain (%)": round((gain / invested * 100.0) if invested > 0 else 0.0, 2),
+                "Sell / Trim Trades": r.get("trades", 0),
+            })
+        ui.safe_dataframe(pd.DataFrame(att_rows), key="s4e_attribution")
+        st.caption("Closed positions (e.g., YESBANK.NS) appear with status resolved when fully exited.")
+    else:
+        st.info("No attribution data available.")
+
+
 def render(ctx: AppContext) -> None:
     f = ctx.filters
     st.markdown("### Direct Equity")
-    st.caption("Direct equity portfolio performance vs benchmark, with sector, concentration and risk breakdowns.")
+    st.caption(
+        "Monthly Direct Equity Decision Engine - action cards, SIP planner, "
+        "sector guardrails and walk-forward backtester."
+    )
     if not f.show_equity:
         st.info("Select Direct Equity in the sidebar Asset type filter to view this page.")
-    else:
-        _render_equity_metrics(ctx)
-        st.divider()
-        _render_stock_attribution(ctx)
-        st.divider()
-        _render_whatif_simulator(ctx)
-        st.divider()
+        return
+
+    tab_action, tab_sector, tab_backtest = st.tabs([
+        "Monthly Action & SIP Engine",
+        "Sector & Concentration",
+        "Strategy Backtester (3Y / 5Y / 7Y)",
+    ])
+    with tab_action:
         _render_stage4_action_center(ctx)
         st.divider()
         _render_stage4_planner(ctx)
-        st.divider()
+    with tab_sector:
         _render_sector_breakdowns(ctx)
-        st.divider()
-        _render_attention(ctx)
-        st.divider()
-        _render_xirr_diagnostics_section(ctx)
-        st.divider()
-        _render_gains_dividends(ctx)
-        st.divider()
-        _render_signal_history(ctx)
-
-    try:
-        from copilot.ui import render_copilot
-        render_copilot(ctx, "performance")
-    except Exception:  # noqa: BLE001, S110
-        pass
+    with tab_backtest:
+        _render_stage4_backtester(ctx)

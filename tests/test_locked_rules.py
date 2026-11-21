@@ -24,7 +24,7 @@ def test_locked_constants():
     assert s4.SIP_LANE1_MULT == 2.50
     assert s4.MAX_SINGLE_STOCK_SIP == 35000.0
     assert s4.SIP_RUN_UP_DMA_DISTANCE == 0.30
-    assert s4.SIP_OVERALLOC_AER == 1.35
+    assert s4.SIP_OVERALLOC_AER == 1.25
     assert s4.TRAILING_PEAK_MULT == 2.00
     assert s4.TRAILING_STOP_FLOOR == 0.35
 
@@ -136,13 +136,12 @@ def _tot() -> s4.PortfolioTotals:
 
 
 def test_gtt_incubation_catastrophe_floor():
-    # Invested < ₹1,00,000 BUT held > 365 days -> NOT incubating; evaluated for Catastrophe Floor (40%)
+    # Invested < ₹1,00,000 BUT held > 365 days -> NOT incubating; evaluated for Cost Floor
     st = _stock("INC", series=[100.0] * 100, invested=50000.0, avg=100.0, mv=50000.0, xirr=0.10)
     m = s4.analyzeStockSignals(st, _tot(), 0.12, as_of_date=date(2026, 1, 1))
     assert m["incubation"] is False
-    assert m["gtt_anchor_type"] == "Catastrophe Floor (40%)"
-    assert abs(m["gtt_stop_loss_price"] - 100.0 * 0.60) < 1e-6
-    assert m["gtt_stop_loss_price"] >= 100.0 * 0.55
+    assert m["gtt_anchor_type"] == "Cost Floor"
+    assert abs(m["gtt_stop_loss_price"] - 62.5) < 1e-6  # Cost Floor (37.5% stop)
 
 
 def test_old_stock_not_re_entered_incubation_after_sell_below_cost():
@@ -153,8 +152,8 @@ def test_old_stock_not_re_entered_incubation_after_sell_below_cost():
     assert m["incubation"] is False   # days > 365 → never incubating again
     assert m["gtt_anchor_type"] != "Catastrophe Floor (40%)"
     # Should not get fresh 1.0x SIP; evaluate signals normally (not incubating lock).
-    rows = s4.evaluate_signals([st], _tot(), 0.12, as_of_date=date(2026, 2, 1))[0]
-    assert rows[0]["sip_multiplier"] == 0.0 or rows[0]["signal_type"] != "Incubating"
+    row = s4.evaluate_signals([st], _tot(), 0.12, as_of_date=date(2026, 2, 1))[0]
+    assert row["sip_multiplier"] == 0.0 or row["signal_type"] != "Incubating"
 
 
 def test_gtt_young_stock_incubation():

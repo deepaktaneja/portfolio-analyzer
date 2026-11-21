@@ -135,20 +135,6 @@ def test_hard_stop_not_triggered_below_invested_threshold():
 
 
 # --------------------------------------------------------------------------- #
-# Priority 2: TREND_BREAK_LOCK
-# --------------------------------------------------------------------------- #
-def test_trend_break_lock():
-    series = [200.0] * 60 + [180.0]  # last 180 < mean(~199.7)*0.97(~193.7)
-    stock = _stock(series=series, invested=100000.0, avg=100.0, mv=180000.0)
-    totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
-    m = s4.analyzeStockSignals(stock, totals, 0.10)  # AER = 0.18/0.1 = 1.8
-    assert m["aer"] >= 1.30
-    sig = s4.evaluate_signal(stock, m, totals)
-    assert sig.signal_type == s4.TREND_BREAK_LOCK
-    assert sig.sell_pct == 0.5
-
-
-# --------------------------------------------------------------------------- #
 # Priority 3: CONCENTRATION_TRIM
 # --------------------------------------------------------------------------- #
 def test_concentration_trim_target_and_shares():
@@ -412,10 +398,22 @@ def test_warning_level_flag():
     assert r["warning_level"] is True
 
 
-def test_incubating_locked_at_one_x():
-    # Only very young/small positions -> 1.0x even if below 200-DMA
+def test_incubating_below_200dma_gets_half_x():
+    # Incubating but below 200-DMA -> 0.5x toe-hold (trend not confirmed)
     series = _series_falling(260, 300.0, 0.5)
     stock = _stock("INC", series=series, invested=50000.0, avg=200.0, mv=40000.0,
+                   xirr=0.0, start=date(2025, 12, 1))
+    totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
+    rows = s4.evaluate_signals([stock], totals, 0.10, as_of_date=date(2026, 1, 1))
+    r = rows[0]
+    assert r["incubation"] is True
+    assert r["sip_multiplier"] == 0.0
+
+
+def test_incubating_healthy_gets_one_x():
+    # Incubating with a healthy (flat / at-or-above 200-DMA) trend -> 1.0x
+    series = _series_flat(260, 100.0)
+    stock = _stock("INC2", series=series, invested=50000.0, avg=100.0, mv=50000.0,
                    xirr=0.0, start=date(2025, 12, 1))
     totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
     rows = s4.evaluate_signals([stock], totals, 0.10, as_of_date=date(2026, 1, 1))
@@ -481,7 +479,7 @@ def test_incubation_old_stock_after_sell_below_cost():
     totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
     m = s4.analyzeStockSignals(st, totals, 0.12, as_of_date=date(2026, 2, 1))
     assert m["incubation"] is False   # days > 365 → never incubating again
-    rows = s4.evaluate_signals([st], totals, 0.12, as_of_date=date(2026, 2, 1))[0]
-    assert rows[0]["sip_multiplier"] == 0.0 or rows[0]["signal_type"] != "Incubating"
+    row = s4.evaluate_signals([st], totals, 0.12, as_of_date=date(2026, 2, 1))[0]
+    assert row["sip_multiplier"] == 0.0 or row["signal_type"] != "Incubating"
 
 

@@ -36,6 +36,8 @@ class MarketDataStore:
             c.execute('''CREATE TABLE IF NOT EXISTS dividend_events (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id TEXT NOT NULL, ex_date TEXT, record_date TEXT, payment_date TEXT, dividend_per_share REAL, currency TEXT, source TEXT, provider TEXT, raw_value REAL, fetched_at TEXT, imported_at TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, verification_status TEXT NOT NULL DEFAULT 'provisional', UNIQUE(security_id, ex_date, dividend_per_share))''')
             c.execute('''CREATE TABLE IF NOT EXISTS benchmark_history (id INTEGER PRIMARY KEY AUTOINCREMENT, index_id TEXT NOT NULL, trade_date TEXT NOT NULL, level REAL NOT NULL, close REAL, source TEXT, provider TEXT, raw_value REAL, fetched_at TEXT, imported_at TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, verification_status TEXT NOT NULL DEFAULT 'unverified', UNIQUE(index_id, trade_date))''')
             c.execute('''CREATE TABLE IF NOT EXISTS market_data_sync_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, finished_at TEXT, status TEXT, provider TEXT, scope TEXT, security_count INTEGER NOT NULL DEFAULT 0, rows_inserted INTEGER NOT NULL DEFAULT 0, rows_updated INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, error_text TEXT, details TEXT)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS watchlist_stocks (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, nse_ticker TEXT NOT NULL, company_name TEXT, manual_cmp REAL, added_at TEXT NOT NULL, UNIQUE(nse_ticker))''')
+            c.execute('''CREATE TABLE IF NOT EXISTS backtest_skipped_tickers (ticker TEXT PRIMARY KEY, skipped_at TEXT NOT NULL, reason TEXT)''')
             c.commit()
 
             for tbl, cols in (("stock_prices", [("raw_close", "REAL"), ("adjusted_close", "REAL"), ("provider", "TEXT"), ("fetched_at", "TEXT"), ("verification_status", "TEXT"), ("currency", "TEXT")]), ("index_tri", [("provider", "TEXT"), ("fetched_at", "TEXT"), ("verification_status", "TEXT"), ("raw_level", "REAL")])):
@@ -207,6 +209,120 @@ class MarketDataStore:
 
     def list_security_symbol_map(self, **kwargs):
         return self.get_symbol_map(**kwargs)
+
+    # ---- Persistent watchlist (Simulate New Stock Entry / incubation planner) ----
+    def get_watchlist_stocks(self):
+        """Return every persisted watchlist stock ordered by insertion time."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, isin, nse_ticker, company_name, manual_cmp, added_at "
+                "FROM watchlist_stocks ORDER BY added_at, id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_watchlist_stock(self, isin=None, nse_ticker=None, company_name=None, manual_cmp=None):
+        """Insert (or refresh) a watchlist stock keyed by its canonical NSE ticker.
+
+        Returns the row id. Upserts on ``nse_ticker`` so re-adding the same stock
+        never duplicates the row (idempotent POST semantics).
+        """
+        ticker = str(nse_ticker or "").strip().upper()
+        if not ticker:
+            raise ValueError("nse_ticker is required to add a watchlist stock")
+        isin_val = str(isin).strip().upper() if isin else None
+        name_val = str(company_name).strip() if company_name else None
+        cmp_val = float(manual_cmp) if manual_cmp is not None else None
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT id FROM watchlist_stocks WHERE nse_ticker=?", (ticker,)
+            ).fetchone()
+            if existing is not None:
+                c.execute(
+                    "UPDATE watchlist_stocks SET isin=COALESCE(?, isin), "
+                    "company_name=COALESCE(?, company_name), "
+                    "manual_cmp=COALESCE(?, manual_cmp) WHERE id=?",
+                    (isin_val, name_val, cmp_val, existing["id"]),
+                )
+                c.commit()
+                return int(existing["id"])
+            cur = c.execute(
+                "INSERT INTO watchlist_stocks (isin, nse_ticker, company_name, manual_cmp, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (isin_val, ticker, name_val, cmp_val, _now()),
+            )
+            c.commit()
+            return int(cur.lastrowid)
+
+    def delete_watchlist_stock(self, stock_id=None, nse_ticker=None):
+        """Delete one watchlist stock by ``id`` or ``nse_ticker`` (DELETE semantics)."""
+        with self._conn() as c:
+            if stock_id is not None:
+                cur = c.execute("DELETE FROM watchlist_stocks WHERE id=?", (int(stock_id),))
+            elif nse_ticker:
+                cur = c.execute(
+                    "DELETE FROM watchlist_stocks WHERE nse_ticker=?",
+                    (str(nse_ticker).strip().upper(),),
+                )
+            else:
+                return 0
+            c.commit()
+            return int(cur.rowcount or 0)
+
+    def get_watchlist_stock(self, isin=None, nse_ticker=None):
+        """Look up a single watchlist row by ISIN or NSE ticker (for name/link resolution)."""
+        with self._conn() as c:
+            if nse_ticker:
+                row = c.execute(
+                    "SELECT id, isin, nse_ticker, company_name, manual_cmp, added_at "
+                    "FROM watchlist_stocks WHERE nse_ticker=?",
+                    (str(nse_ticker).strip().upper(),),
+                ).fetchone()
+            elif isin:
+                row = c.execute(
+                    "SELECT id, isin, nse_ticker, company_name, manual_cmp, added_at "
+                    "FROM watchlist_stocks WHERE isin=?",
+                    (str(isin).strip().upper(),),
+                ).fetchone()
+            else:
+                row = None
+        return dict(row) if row is not None else None
+
+    # ---- Backtest skip markers (delisted / no-data tickers) ----
+    def get_skipped_tickers(self):
+        """Return persisted skip markers so delisted tickers are not retried."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT ticker, skipped_at, reason FROM backtest_skipped_tickers"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_skipped_tickers(self, tickers, reason="no_data"):
+        """Persist tickers to skip on future backtest cache runs (idempotent)."""
+        now = _now()
+        with self._conn() as c:
+            for t in tickers or []:
+                tk = str(t).strip().upper()
+                if not tk:
+                    continue
+                c.execute(
+                    "INSERT INTO backtest_skipped_tickers (ticker, skipped_at, reason) "
+                    "VALUES (?, ?, ?) ON CONFLICT(ticker) DO UPDATE SET "
+                    "skipped_at=excluded.skipped_at, reason=excluded.reason",
+                    (tk, now, reason),
+                )
+            c.commit()
+
+    def clear_skipped_tickers(self, tickers=None):
+        """Clear skip markers (all, or only the given tickers)."""
+        with self._conn() as c:
+            if tickers:
+                for t in tickers:
+                    c.execute("DELETE FROM backtest_skipped_tickers WHERE ticker=?",
+                              (str(t).strip().upper(),))
+            else:
+                c.execute("DELETE FROM backtest_skipped_tickers")
+            c.commit()
+
     def _ca_to_dict(self, r):
         if isinstance(r, dict):
             return r
