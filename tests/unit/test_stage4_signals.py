@@ -139,15 +139,15 @@ def test_hard_stop_not_triggered_below_invested_threshold():
 # --------------------------------------------------------------------------- #
 def test_concentration_trim_target_and_shares():
     stock = _stock(series=_series_rising(260, 90.0, 0.05), invested=100000.0, avg=100.0,
-                   mv=200000.0, xirr=0.30)
+                   mv=250000.0, xirr=0.30)
     totals = s4.PortfolioTotals(total_invested_cost=1e6, total_market_value=1e6)
     m = s4.analyzeStockSignals(stock, totals, 0.10)
-    assert abs(m["aer"] - 2.0) < 1e-9  # 0.2/0.1
+    assert abs(m["aer"] - 2.5) < 1e-9  # 0.25/0.1
     sig = s4.evaluate_signal(stock, m, totals)
     assert sig.signal_type == s4.CONCENTRATION_TRIM
     cmp = stock.cmp
-    assert abs(sig.target_sell_rupees - 60000.0) < 1e-6  # 200000 - 1.40*0.1*1e6
-    assert sig.shares_to_sell == math.floor(60000.0 / cmp)
+    assert abs(sig.target_sell_rupees - 110000.0) < 1e-6  # 250000 - 1.40*0.1*1e6
+    assert sig.shares_to_sell == math.floor(110000.0 / cmp)
 
 
 # --------------------------------------------------------------------------- #
@@ -344,7 +344,7 @@ def test_evaluate_signal_trim_aer_override():
                     mv=140000.0, xirr=0.30)
     m2 = s4.analyzeStockSignals(stock2, totals, 0.10)  # AER = 1.4
     assert 1.35 <= m2["aer"] < 1.50
-    sig_def = s4.evaluate_signal(stock2, m2, totals)  # default trim_aer=1.50 -> no trim
+    sig_def = s4.evaluate_signal(stock2, m2, totals)  # default trim_aer=2.20 -> no trim
     sig_low = s4.evaluate_signal(stock2, m2, totals, trim_aer=1.30, min_market_value=100000.0)
     assert sig_def.signal_type != s4.CONCENTRATION_TRIM
     assert sig_low.signal_type == s4.CONCENTRATION_TRIM

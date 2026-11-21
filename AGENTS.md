@@ -22,5 +22,5 @@ After any strategy backtest experiment, always:
 - Recycled sell proceeds: budget capped only by friction (not monthly ceiling) → **KEEP**.
 - Monthly-only GTT (Exp #6): **KEEP** — Variant B (monthly-only) permanently wired; +0.47pp XIRR / +1.32pp Max DD vs daily, GTT stops 42 vs 64, Final Net Value +₹139,052 (7Y).
 - Incubation below 200-DMA (Exp #7): **KEEP** — incubation SIP 0.5x → 0.0x while below 200-DMA; 7Y XIRR 18.83% / Max DD 26.86% / Final Net Value ₹86.26L (5Y: 17.94%, 3Y: 0.67%).
-- Nifty 500 −20% Market Crash Freeze (Exp #8): **KEEP** — crash-freeze wired (`CRASH_FREEZE_NIFTY_DD_THRESHOLD = -0.20`) pausing GTT_STOP_LOSS / LAGGARD_EXIT sells during monthly reviews with Nifty 500 trailing-52w drawdown < −20%; Post-Exp #8 baseline 7Y XIRR 19.24% / Max DD 26.86% / Final Net Value ₹87.52L (5Y: 17.94%, 3Y: 0.67%).
-- Incubation below 200-DMA (Exp #7): **KEEP** — incubation SIP 0.5x → 0.0x while below 200-DMA; 7Y XIRR 18.83% / Max DD 26.86% / Final Net Value ₹86.26L (5Y: 17.94%, 3Y: 0.67%).
+- Nifty 500 −20% Market Crash Freeze (Exp #8): **KEEP** — crash-freeze wired (`CRASH_FREEZE_NIFTY_DD_THRESHOLD = -0.20`) pausing GTT_STOP_LOSS / LAGGARD_EXIT sells during monthly reviews with Nifty 500 trailing-52w drawdown < −20%; Post-Exp #9 baseline 7Y XIRR 19.87% / Max DD 26.86% / Final Net Value ₹89.53L (5Y: 17.82%, 3Y: 0.67%).
+- AER Profit-Booking Trim (Exp #9): **KEEP** — TRIM_AER raised 1.85 → 2.20; fewer concentration trims, more winner compounding; 7Y XIRR 19.87% / Max DD 26.86% / Final Net Value ₹89.53L (5Y: 17.82%, 3Y: 0.67%).

@@ -18,7 +18,7 @@ def test_lane1_returns_2_5x():
     assert s4.compute_sip_multiplier(st, metrics, 0.12) == 2.5
 
 def test_locked_constants():
-    assert s4.TRIM_AER == 1.85
+    assert s4.TRIM_AER == 2.20
     assert s4.TRIM_TARGET_MULT == 1.40
     assert s4.SIP_PULLBACK_AER_MAX == 1.30
     assert s4.SIP_LANE1_MULT == 2.50

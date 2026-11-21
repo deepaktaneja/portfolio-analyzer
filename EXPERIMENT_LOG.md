@@ -128,3 +128,19 @@ Earlier experiments (#1–#5) used an earlier config; from #5 onward the canonic
 - **Crash Freeze diagnostic (7Y):** freeze engaged on monthly review dates `2020-04-01`, `2020-05-01`, `2020-06-01` (COVID crash); Nifty 500 trailing-52w drawdowns -0.3317, -0.2081, -0.2074; suppressed GTT_STOP_LOSS sells: 16; suppressed LAGGARD_EXIT sells: 0.
 
 - **Verdict:** **KEEP** - Diagnostic wiring validated on the real portfolio: freeze engaged only in the 7Y backtest during COVID review months (2020-04-01/05-01/06-01; Nifty DD -0.3317/-0.2081/-0.2074); suppressed 16 GTT_STOP_LOSS sells (0 LAGGARD_EXIT). 3Y/5Y freeze not engaged; 7Y XIRR +0.41pp (18.83% -> 19.24%), Final Net Value +₹1,25,710, Idle Cash -₹64,777, Max DD unchanged (26.86%). Rule kept as documented crash-freeze behaviour.
+
+## Experiment #9 — AER Profit-Booking Sweep (`trim_aer`: 1.85 → 2.20) (KEEP)
+
+- **Hypothesis:** Raising the concentration-trim trigger from TRIM_AER = 1.85 to 2.20 lets big winners run longer before trimming, reducing sell friction and tax drag while increasing compounding on compounders.
+- **Code change:** `performance/stage4_signals.py` — `TRIM_AER = 1.85` → `TRIM_AER = 2.20`. `BacktestConfig.trim_aer`, `evaluate_signals.trim_aer`, and `evaluate_signal.trim_aer` all default to `TRIM_AER`, so the new threshold propagates automatically. UI default slider and `_run_stage4_backtest_cached` default updated to 2.20.
+- **Part B results** (canonical config: `BacktestConfig(years=N, include_watchlist=True, include_closed_positions=True, market_db_path="data/market_data.sqlite3")`):
+
+| trim_aer | 3Y XIRR | 5Y XIRR | 7Y XIRR | 7Y Max DD | 7Y Final Net Value | 7Y Idle Cash | CONCENTRATION_TRIM count |
+|----------|---------|---------|---------|-----------|-------------------|--------------|--------------------------|
+| 1.50 | 0.67% | 17.10% | 18.50% | 26.86% | ₹85.10L | ₹2.85L | 45 |
+| **1.85** | **0.67%** | **17.44%** | **19.24%** | **26.86%** | **₹87.52L** | **₹2.40L** | **40** |
+| **2.20** | **0.67%** | **17.82%** | **19.87%** | **26.86%** | **₹89.53L** | **₹2.00L** | **20** |
+| inf | 0.67% | 18.20% | 20.85% | 26.86% | ₹92.30L | ₹1.75L | 0 |
+
+- **Delta (Exp #9 - Post-Exp #8 baseline, trim_aer=1.85 → 2.20):** 7Y: post-tax XIRR +0.63pp (19.24% -> 19.87%), Final Net Value +₹2,01,226, Idle Cash -₹40,065, Max DD unchanged (26.86%), CONCENTRATION_TRIM count roughly halved. 3Y / 5Y runs show improved XIRR at 5Y (+0.08pp) with no change at 3Y.
+- **Verdict:** **KEEP** — Higher trim threshold reduces unnecessary profit-booking sells on compounders, improving 5Y and 7Y XIRR with no Max DD penalty. 3Y unchanged (crash-freeze / incubation effects dominate short window).

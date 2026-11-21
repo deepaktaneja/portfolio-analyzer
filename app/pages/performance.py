@@ -1292,7 +1292,7 @@ def _actual_ledger_metrics(txs, price_lookup, dividend_flows, corporate_actions,
 
 def _stage4_playbook_markdown(live: dict) -> str:
     """Build the full Strategy Playbook markdown with live-synced parameters."""
-    trim_aer = live.get("trim_aer", 1.85)
+    trim_aer = live.get("trim_aer", 2.20)
     stop_mult = live.get("stop_mult", 1.5)
     min_mv = live.get("min_mv", 200000)
     bench = live.get("bench_xirr", 0.12)
@@ -1362,7 +1362,7 @@ def _stage4_playbook_markdown(live: dict) -> str:
              "(business is compounding; valuation is just cooling off).")
     L.append("- **Exit 100% & Reallocate:** Quarterly YoY Revenue/Profit growth stalled < 10% for 2 consecutive quarters.")
     L.append("- **Tax-Loss Harvesting Bonus:** Prefer exiting stagnant laggards sitting at a loss during Feb–March "
-             "to offset realized LTCG/STCG taxes from AER ≥ 1.85x profit trims.")
+             "to offset realized LTCG/STCG taxes from AER ≥ 2.20x profit trims.")
     L.append("")
     L.append("## 7. Staggered Cash Redeployment Playbook")
     L.append("Deploy cash freed up from HARD_STOP_LOSS, CONCENTRATION_TRIM, or LAGGARD_EXIT:")
@@ -1426,7 +1426,7 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
     st.markdown("**Formula Controls**")
     cc = st.columns(4)
     with cc[0]:
-        trim_aer = st.slider("Profit Trim AER Trigger", 1.20, 2.50, 1.85, 0.05, key="s4_trim_aer",
+        trim_aer = st.slider("Profit Trim AER Trigger", 1.20, 2.50, 2.20, 0.05, key="s4_trim_aer",
                              help="Trim when AER >= this; weight resets to 1.40x cost weight.")
     with cc[1]:
         stop_mult = st.slider("Volatility Stop-Loss x", 1.0, 3.0, 1.5, 0.1, key="s4_stop_mult",
@@ -2104,7 +2104,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
 
 @st.cache_data(show_spinner="Running walk-forward backtest...")
 def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
-                                trim_aer=1.85, trim_target_mult=1.40):
+                                trim_aer=2.20, trim_target_mult=1.40):
     """Cached wrapper around run_backtest() (module-level so st.cache_data persists)."""
     import json
 
@@ -2170,8 +2170,8 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         )
     with c4:
         compare_trim = st.checkbox(
-            "Compare 1.85x vs. 2.25x AER Trim", value=True, key="s4e_compare_trim",
-            help="Run the 1.85x (1.40x reset) and 2.25x (1.60x reset) concentration-trim rules side-by-side.",
+            "Compare 2.20x vs. 2.25x AER Trim", value=True, key="s4e_compare_trim",
+            help="Run the 2.20x (1.40x reset) and 2.25x (1.60x reset) concentration-trim rules side-by-side.",
         )
     with c5:
         run_btn = st.button(
@@ -2262,7 +2262,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     fig.add_trace(
         go.Scatter(
             x=port_dates, y=port_values,
-            name=("Stage 4 (1.85x Trim)" if res_225 else "Stage 4 Engine (Post-Tax)"),
+            name=("Stage 4 (2.20x Trim)" if res_225 else "Stage 4 Engine (Post-Tax)"),
             line={"width": 2, "color": "#1f77b4"},
         )
     )
@@ -2384,7 +2384,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             "Sell / Trim Trades": sc.get("trade_count", b.get("trade_count", 0)),
         }
 
-    sc_rows.append(_sc_row("Stage 4 (1.85x Trim)" if res_225 else "Stage 4 Engine (Current Portfolio)", res_main))
+    sc_rows.append(_sc_row("Stage 4 (2.20x Trim)" if res_225 else "Stage 4 Engine (Current Portfolio)", res_main))
     if res_225:
         sc_rows.append(_sc_row("Stage 4 (2.25x Trim)", res_225))
     if res_wl:
@@ -2534,7 +2534,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         cy_rows = []
         for y in all_years:
             label = cy_index.get(y, str(y))
-            row = {"Year": label, ("Stage 4 (1.85x Trim) (%)" if res_225 else "Stage 4 Engine (%)"): cy.get(label)}
+            row = {"Year": label, ("Stage 4 (2.20x Trim) (%)" if res_225 else "Stage 4 Engine (%)"): cy.get(label)}
             if res_225:
                 label_225 = cy_225_index.get(y, label)
                 row["Stage 4 (2.25x Trim) (%)"] = cy_225.get(label_225)

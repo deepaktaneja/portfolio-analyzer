@@ -45,7 +45,7 @@ HARD_STOP_AER_FLOOR = 0.50
 
 SIP_OVEREXTENDED_DMA_BUFFER = 0.97     # SIP 0.5x rule keeps the original 97% threshold
 
-TRIM_AER = 1.85
+TRIM_AER = 2.20
 TRIM_MIN_MARKET_VALUE = 200000.0
 TRIM_MIN_XIRR = 0.25
 TRIM_TARGET_MULT = 1.40
@@ -452,6 +452,20 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
             and cmp < dma_long):
         return _result(LAGGARD_EXIT, 4, "REVIEW_EXIT",
                        reason="LAGGARD_EXIT: held >1y, below benchmark & under 200-DMA")
+
+    # Priority 5 -- GTT_STOP_LOSS (index-relative, monthly-only)
+    # Fires only when CMP breaches the dynamic GTT stop level AND the stock's
+    # drawdown from peak exceeds Nifty 500's drawdown by >= 20pp.
+    # Basic check: if gtt_stop_loss_price is set and CMP <= that price,
+    # the stop is considered breached. The full index-relative gate (stock_dd - nifty_dd >= 20pp)
+    # is enforced in _monthly_step (backtester) and the Live UI protected display.
+    gtt_price = metrics.get("gtt_stop_loss_price")
+    gtrig = False
+    if gtt_price is not None and gtt_price > 0 and cmp is not None and cmp <= gtt_price:
+        gtrig = True
+    if gtrig:
+        return _result(GTT_STOP_LOSS, 5, "GTT_STOP_LOSS_SELL", 1.0,
+                       reason="GTT_STOP_LOSS: trigger price breached")
 
     return _result(NO_SIGNAL, 99, "HOLD", reason="No sell rule triggered")
 

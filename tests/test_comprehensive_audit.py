@@ -1201,12 +1201,12 @@ def test_aer_zero_cost_and_empty_portfolio_default_to_one():
 def test_aer_two_x_triggers_concentration_trim():
     from performance import stage4_signals as s4
 
-    # Doubles (aer = 2.0), market value >= Rs 2L and XIRR 30% -> TRIM fires.
-    stock = _aer_stock("BIG", invested=100000.0, mv=200000.0, xirr=0.30)
+    # AER = 2.3 (> TRIM_AER = 2.20), market value >= Rs 2L and XIRR 30% -> TRIM fires.
+    stock = _aer_stock("BIG", invested=100000.0, mv=230000.0, xirr=0.30)
     totals = s4.PortfolioTotals(total_invested_cost=1_000_000.0,
                                 total_market_value=1_000_000.0)
     m = s4.analyzeStockSignals(stock, totals, 0.12)
-    assert abs(m["aer"] - 2.0) < 1e-9
+    assert abs(m["aer"] - 2.3) < 1e-9
     sig = s4.evaluate_signal(stock, m, totals)
     assert sig.signal_type == s4.CONCENTRATION_TRIM
 
