@@ -2326,6 +2326,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     import plotly.graph_objects as go
 
     from performance import backtest_data as bd
+    from performance.backtest_report import build_backtest_markdown_report
     from performance.stage4_backtest import (
         backtest_cache_dir,
         compute_backtest_data_signature,
@@ -2339,7 +2340,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         "Zero look-ahead bias; advisory only - nothing is executed."
     )
 
-    c1, c2, c3, c4 = st.columns([1.4, 1.7, 1.7, 1.0])
+    c1, c2, c3, c4, c5 = st.columns([1.4, 1.7, 1.7, 1.0, 0.8])
     with c1:
         years = st.radio(
             "Timeframe", [3, 4, 5, 6, 7], index=4, horizontal=True, key="s4e_years",
@@ -2358,6 +2359,10 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     with c4:
         run_btn = st.button(
             "Run Backtest", key="s4e_run", type="primary", use_container_width=True,
+        )
+    with c5:
+        export_btn = st.button(
+            "Export AI Report (All Horizons .md)", key="s4e_export", use_container_width=True,
         )
 
     txs = ctx.txs
@@ -2379,7 +2384,13 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     years_int = int(years)
     include_closed_bool = bool(include_closed)
     cache_dir = backtest_cache_dir()
-    data_signature = compute_backtest_data_signature(market_db, txs)
+
+    @st.cache_data(ttl=60)
+    def _cached_data_signature(market_db_path: str | None, txs_json_str: str) -> str:
+        txs_list = json.loads(txs_json_str) if txs_json_str else []
+        return compute_backtest_data_signature(market_db_path, txs_list)
+
+    data_signature = _cached_data_signature(market_db, txs_json)
     cached_base, cached_base_meta = load_backtest_cache(
         cache_dir,
         person_id=person_id,
@@ -2423,8 +2434,92 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             st.info("Configure the controls above and click **Run Backtest** to simulate.")
             return
         st.caption(cache_status)
-        if cache_stale:
-            st.caption("⚠️ Prices or transactions updated since this run — click Run Backtest to refresh.")
+
+    # Export AI Report handler
+    if export_btn and res_main is not None:
+        try:
+            import datetime as _dt
+            from pathlib import Path
+
+            cache_dir = backtest_cache_dir()
+            person_id = getattr(ctx.filters, "person_id", None) or getattr(ctx.filters, "person_id", None) or ""
+            person_str = str(person_id) if person_id else "unknown"
+            today_str = _dt.datetime.now().strftime("%Y-%m-%d")
+            out_path = Path(cache_dir) / f"backtest_ai_report_{person_str}_{today_str}.md"
+
+            # Ensure all 5 horizons are cached
+            horizons = [3, 4, 5, 6, 7]
+            results_by_horizon = {}
+            meta = {"generated_at": _dt.datetime.now().astimezone().isoformat(),
+                    "profile": person_str,
+                    "compare_watchlist": False,
+                    "include_closed": include_closed_bool,
+                    "price_cache_date": str(cache_dir)}
+
+            with st.status("Generating AI Backtest Report...", expanded=True) as status:
+                for h in horizons:
+                    st.write(f"Loading/running {h}Y...")
+                    cached, _ = load_backtest_cache(
+                        cache_dir, person_id=person_id, years=h,
+                        compare_watchlist=False, include_closed=include_closed_bool,
+                    )
+                    if cached is not None:
+                        results_by_horizon[h] = cached
+                    else:
+                        # Run and cache the missing horizon
+                        try:
+                            from performance.stage4_backtest import run_backtest as _run
+
+                            cfg = type("_Cfg", (), {"years": h, "include_watchlist": True,
+                                                    "include_closed_positions": True,
+                                                    "base_unit_sip": 10000.0,
+                                                    "max_monthly_ceiling": 200000.0,
+                                                    "trim_aer": 1.85,
+                                                    "trim_target_mult": 1.0,
+                                                    "market_db_path": ctx.market_db_path,
+                                                    "start_date": None})()
+                            res = _run(cfg, ctx.market_db_path, ctx.txs, None)
+                            results_by_horizon[h] = res
+                        except (ValueError, KeyError, TypeError) as e:
+                            st.error(f"Failed to run backtest for {h}Y: {e}")
+
+                # Also ensure metadata has the right compare_watchlist value
+                if compare_wl:
+                    meta["compare_watchlist"] = True
+
+                # Generate the markdown report
+                st.write("Generating Markdown report...")
+                report_md = build_backtest_markdown_report(results_by_horizon, meta)
+
+                # Save to file
+                out_path.write_text(report_md, encoding="utf-8")
+
+                status.update(label="AI Report generated", state="complete")
+
+            # Store in session state for persistent download button across reruns
+            st.session_state["backtest_ai_report"] = {
+                "markdown": report_md,
+                "filename": out_path.name,
+                "path": str(out_path),
+            }
+
+            st.success(f"AI Report saved to: {out_path}")
+
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Export failed: {exc}")
+
+    # Render download button from session state (persists across Streamlit reruns)
+    if "backtest_ai_report" in st.session_state:
+        _report = st.session_state["backtest_ai_report"]
+        st.download_button(
+            label="Download AI Report (.md)",
+            data=_report["markdown"],
+            file_name=_report["filename"],
+            mime="text/markdown",
+        )
+
+    if cache_stale:
+        st.caption("⚠️ Prices or transactions updated since this run — click Run Backtest to refresh.")
 
     if should_run:
         with st.spinner("Simulating base portfolio..."):
