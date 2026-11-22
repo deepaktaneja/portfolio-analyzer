@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .env
 data/
+data/backtest_cache/
 reports/*
 !reports/__init__.py
 !reports/exports.py

@@ -26,6 +26,9 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from itertools import pairwise
+from typing import Any
+
+from performance import backtest_data as bd
 
 # --------------------------------------------------------------------------- #
 # Tunable constants (single source of truth for the whole stage)
@@ -91,6 +94,7 @@ LAGGARD_MIN_DAYS = 365
 HARD_STOP_LOSS = "HARD_STOP_LOSS"
 CONCENTRATION_TRIM = "CONCENTRATION_TRIM"
 LAGGARD_EXIT = "LAGGARD_EXIT"
+GTT_STOP_LOSS = "GTT_STOP_LOSS"
 NO_SIGNAL = "NONE"
 
 FROZEN_SIGNALS = (HARD_STOP_LOSS,)
@@ -268,7 +272,7 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
                         benchmarkXIRR: float | None,
                         stop_loss_mult: float = STOP_LOSS_MULT,
                         as_of_date=None,
-                        excluded_tickers: set[str] = None) -> dict:
+                        excluded_tickers: set[str] | None = None) -> dict:
     """Compute the full metric bundle for one stock.
 
     Returns a dict with the 50/200-DMA, annualised volatility, dynamic
@@ -376,7 +380,6 @@ def analyzeStockSignals(stock: StockInput, portfolioTotals: PortfolioTotals,
         "insufficient_data": n < MIN_TRADING_DAYS,
         "excluded": excluded,
     }
-    metrics["excluded"] = excluded
 
 
 # --------------------------------------------------------------------------- #
@@ -394,7 +397,7 @@ def _held_days(stock: StockInput, as_of_date) -> int | None:
 def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: PortfolioTotals,
                     as_of_date=None, trim_aer: float = TRIM_AER,
                     min_market_value: float = TRIM_MIN_MARKET_VALUE,
-                    excluded_tickers: set[str] = None,
+                    excluded_tickers: set[str] | None = None,
                     trim_target_mult: float = TRIM_TARGET_MULT) -> SignalResult:
     """Apply the four signal rules in strict priority order for one stock.
 
@@ -473,7 +476,16 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
 # --------------------------------------------------------------------------- #
 # Nifty 500 trailing 52-week drawdown helpers
 # --------------------------------------------------------------------------- #
-def _nifty500_52w_drawdown(prices: PriceIndex, d: date) -> float | None:
+def _nifty500_price(prices: Any, d: date) -> float | None:
+    """Nifty 500 close at-or-before ``d`` (^CRSLDX, MONIFTY500.NS ETF fallback)."""
+    for ticker in bd.NIFTY500_TICKERS:
+        px = prices.price_on(ticker, d)
+        if px is not None and px > 0:
+            return px
+    return None
+
+
+def _nifty500_52w_drawdown(prices: Any, d: date) -> float | None:
     """Trailing 52-week-high drawdown of the Nifty 500 (^CRSLDX / MONIFTY500.NS).
 
     Drawdown is expressed as a NEGATIVE fraction of the trailing 52-week high
@@ -484,13 +496,19 @@ def _nifty500_52w_drawdown(prices: PriceIndex, d: date) -> float | None:
     end_px = _nifty500_price(prices, d)
     if end_px is None or end_px <= 0:
         return None
-    window_start = d - timedelta(days=365)  # ~52 weeks of trading history
-    high = None
+    window_start = d - timedelta(days=365)
+    high: float | None = None
     for ticker in bd.NIFTY500_TICKERS:
-        px = prices.price_on(ticker, d)
-        if px is not None and px > 0:
-            return px
-    return None
+        px_series = prices.series_upto(ticker, d)
+        dd_series = prices.dates_upto(ticker, d)
+        for dd, px in zip(dd_series, px_series):
+            if dd < window_start or px is None or px <= 0:
+                continue
+            if high is None or px > high:
+                high = px
+    if high is None or high <= 0:
+        return None
+    return (end_px - high) / high
 
 
 def get_nifty500_52w_drawdown(as_of=None, db_path=None, prices=None):
@@ -513,7 +531,7 @@ def get_nifty500_52w_drawdown(as_of=None, db_path=None, prices=None):
              str((as_of or date.today()) - timedelta(days=365)).isoformat())
         ).fetchall()
         con.close()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     if not rows:
         # fallback to MONIFTY500.NS
@@ -525,7 +543,7 @@ def get_nifty500_52w_drawdown(as_of=None, db_path=None, prices=None):
                  str((as_of or date.today()) - timedelta(days=365)).isoformat())
             ).fetchall()
             con.close()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
     prices_list = [float(r[1]) for r in rows if r[1] is not None]
     if not prices_list:
@@ -543,7 +561,7 @@ def get_nifty500_52w_drawdown(as_of=None, db_path=None, prices=None):
 def compute_sip_multiplier(stock: StockInput, metrics: dict, benchmarkXIRR: float | None,
                            frozen: bool = False,
                            max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT,
-                           excluded_tickers: set[str] = None) -> float:
+                           excluded_tickers: set[str] | None = None) -> float:
     # Force zero SIP for excluded tickers so they don't consume budget or get buy signals.
     if excluded_tickers is not None and stock.security_id.strip().upper() in excluded_tickers:
         return 0.0
@@ -627,7 +645,7 @@ def months_to_graduate(invested_cost, starter_sip) -> int | None:
     if sip <= 0:
         return None
     gap = max(0.0, INCUBATION_GRADUATION_TARGET - float(invested_cost or 0.0))
-    return int(math.ceil(gap / sip))
+    return math.ceil(gap / sip)
 
 
 # --------------------------------------------------------------------------- #
@@ -638,7 +656,7 @@ def evaluate_signals(stocks, portfolioTotals: PortfolioTotals,
                      trim_aer: float = TRIM_AER, stop_loss_mult: float = STOP_LOSS_MULT,
                      min_market_value: float = TRIM_MIN_MARKET_VALUE,
                      max_stock_weight_pct: float = MAX_SINGLE_STOCK_WEIGHT_PCT,
-                     excluded_tickers: set[str] = None,
+                     excluded_tickers: set[str] | None = None,
                      trim_target_mult: float = TRIM_TARGET_MULT) -> list[dict]:
     """Evaluate every stock and return enriched, priority-annotated rows."""
     rows: list[dict] = []
@@ -789,7 +807,7 @@ def resolve_watchlist_security(query: str, symbol_map=None):
                     isin = f"{q}.{info['exchange']}"
                     ticker = info.get("symbol") or ""
                     resolved = True
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     from app.shared import security_name
@@ -803,7 +821,7 @@ def resolve_watchlist_security(query: str, symbol_map=None):
     }
 
 
-def build_watchlist_stock_input(entry: dict, as_of_date=None) -> s4.StockInput:
+def build_watchlist_stock_input(entry: dict, as_of_date=None) -> StockInput:
     sid = (
         entry.get("isin") or entry.get("ticker") or entry.get("security_id") or ""
     ).strip().upper() or ""
@@ -821,7 +839,7 @@ def build_watchlist_stock_input(entry: dict, as_of_date=None) -> s4.StockInput:
         price_series = [[as_of_date, float(manual_cmp)]]
     else:
         price_series = []
-    return s4.StockInput(
+    return StockInput(
         security_id=sid,
         symbol=sid,
         quantity=quantity,
@@ -895,7 +913,7 @@ def compute_fixed_budget_sip_allocation(active_rows, watchlist_entries, total_de
 
     remaining_graduated_budget = max(0.0, total_deployable_budget - total_incubating_sip)
 
-    alloc = s4.compute_monthly_sip_allocation(active_rows, remaining_graduated_budget, harvested_cash=0.0, max_single_stock_sip=max_single_stock_sip)
+    alloc = compute_monthly_sip_allocation(active_rows, remaining_graduated_budget, harvested_cash=0.0, max_single_stock_sip=max_single_stock_sip)
     result = {
         "rows": alloc["rows"],
         "deployable_budget": alloc["deployable_budget"],
@@ -961,8 +979,7 @@ def compute_monthly_sip_allocation(rows, total_monthly_budget,
     else:
         cap = float("inf")
     for i in range(len(rows)):
-        if floored[i] > cap:
-            floored[i] = cap
+        floored[i] = min(floored[i], cap)
 
     # Phase 1 -- spread leftover BASE budget by largest remainder, up to cap.
     remaining = base_budget - sum(floored)
@@ -984,7 +1001,7 @@ def compute_monthly_sip_allocation(rows, total_monthly_budget,
 
     # Phase 2 -- route harvested cash into active Lane 1 (2x+) winners up to cap.
     if granularity and granularity > 0:
-        harvest_chunks = max(0, int(round((deployable - base_budget) / granularity)))
+        harvest_chunks = max(0, round((deployable - base_budget) / granularity))
     else:
         harvest_chunks = 0
     lane1_idx = [i for i, m in enumerate(mults) if m >= SIP_LANE1_MULT - 1e-9]
@@ -1490,7 +1507,7 @@ def build_stock_input(transactions, price_lookup, as_of_date, security_id,
     )
 
 
-def build_portfolio_totals(stocks, excluded_tickers: set[str] = None) -> PortfolioTotals:
+def build_portfolio_totals(stocks, excluded_tickers: set[str] | None = None) -> PortfolioTotals:
     """Sum invested cost and market value across :class:`StockInput` objects.
 
     Excluded tickers (set[str]) are subtracted from both total_invested_cost and total_market_value so

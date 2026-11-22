@@ -2273,10 +2273,9 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                        file_name="monthly_sip_gtt_plan.csv", mime="text/csv", key="s4c_csv")
 
 
-@st.cache_data(show_spinner="Running walk-forward backtest...")
-def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
-                                trim_aer=2.20, trim_target_mult=1.40):
-    """Cached wrapper around run_backtest() (module-level so st.cache_data persists)."""
+def _run_stage4_backtest_once(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
+                              trim_aer=2.20, trim_target_mult=1.40):
+    """Run one walk-forward backtest simulation (uncached entry point)."""
     import json
 
     import pandas as pd
@@ -2303,6 +2302,16 @@ def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, 
     return run_backtest(cfg, txs=txs_loaded, holdings=holdings_loaded)
 
 
+@st.cache_data(show_spinner="Running walk-forward backtest...")
+def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
+                                trim_aer=2.20, trim_target_mult=1.40):
+    """Cached wrapper around run_backtest() (module-level so st.cache_data persists)."""
+    return _run_stage4_backtest_once(
+        years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
+        trim_aer=trim_aer, trim_target_mult=trim_target_mult,
+    )
+
+
 def _render_stage4_backtester(ctx: AppContext) -> None:
     """Stage 4E - Strategy Backtester UI (3Y / 4Y / 5Y / 6Y / 7Y).
 
@@ -2311,11 +2320,18 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     """
     import json
     from datetime import date as _d
+    from datetime import datetime as _dt
 
     import pandas as pd
     import plotly.graph_objects as go
 
     from performance import backtest_data as bd
+    from performance.stage4_backtest import (
+        backtest_cache_dir,
+        compute_backtest_data_signature,
+        load_backtest_cache,
+        save_backtest_result,
+    )
 
     st.markdown("#### Strategy Backtester (3Y / 4Y / 5Y / 6Y / 7Y)")
     st.caption(
@@ -2344,13 +2360,10 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             "Run Backtest", key="s4e_run", type="primary", use_container_width=True,
         )
 
-    if not run_btn:
-        st.info("Configure the controls above and click **Run Backtest** to simulate.")
-        return
-
     txs = ctx.txs
     holdings = ctx.holdings
     market_db = ctx.market_db_path
+    person_id = getattr(ctx.filters, "person_id", None)
     if not txs:
         st.info("No equity transactions available.")
         return
@@ -2363,22 +2376,94 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         except Exception:  # noqa: BLE001
             holdings_json = None
 
-    with st.spinner("Simulating base portfolio..."):
-        try:
-            res_main = _run_stage4_backtest_cached(
-                int(years), False, include_closed, market_db, txs_json, holdings_json)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Backtest unavailable: {e}")
-            return
-
-    res_wl = None
+    years_int = int(years)
+    include_closed_bool = bool(include_closed)
+    cache_dir = backtest_cache_dir()
+    data_signature = compute_backtest_data_signature(market_db, txs)
+    cached_base, cached_base_meta = load_backtest_cache(
+        cache_dir,
+        person_id=person_id,
+        years=years_int,
+        compare_watchlist=False,
+        include_closed=include_closed_bool,
+    )
+    cached_wl = None
     if compare_wl:
-        with st.spinner("Simulating with watchlist additions..."):
+        cached_wl, _cached_wl_meta = load_backtest_cache(
+            cache_dir,
+            person_id=person_id,
+            years=years_int,
+            compare_watchlist=True,
+            include_closed=include_closed_bool,
+        )
+
+    res_main = None
+    res_wl = None
+    cache_status = None
+    cache_stale = False
+    should_run = True
+    if cached_base is not None and cached_base_meta is not None:
+        res_main = cached_base
+        res_wl = cached_wl
+        cache_stale = cached_base_meta.get("data_signature") != data_signature
+        saved_at = str(cached_base_meta.get("saved_at") or "")
+        try:
+            saved_dt = _dt.fromisoformat(saved_at)
+            saved_label = saved_dt.strftime("%d %b %Y, %I:%M %p")
+        except (TypeError, ValueError):
+            saved_label = saved_at
+        cache_status = f"📦 Loaded saved backtest ({saved_label})"
+        if cache_stale:
+            cache_status += " — current data signature differs."
+        if not run_btn:
+            should_run = False
+
+    if not run_btn:
+        if res_main is None:
+            st.info("Configure the controls above and click **Run Backtest** to simulate.")
+            return
+        st.caption(cache_status)
+        if cache_stale:
+            st.caption("⚠️ Prices or transactions updated since this run — click Run Backtest to refresh.")
+
+    if should_run:
+        with st.spinner("Simulating base portfolio..."):
             try:
-                res_wl = _run_stage4_backtest_cached(
-                    int(years), True, include_closed, market_db, txs_json, holdings_json)
+                res_main = _run_stage4_backtest_once(
+                    int(years), False, include_closed, market_db, txs_json, holdings_json)
             except Exception as e:  # noqa: BLE001
-                st.error(f"Watchlist comparison unavailable: {e}")
+                st.error(f"Backtest unavailable: {e}")
+                return
+
+        save_backtest_result(
+            res_main,
+            cache_dir=cache_dir,
+            person_id=person_id,
+            years=years_int,
+            compare_watchlist=False,
+            include_closed=include_closed_bool,
+            data_signature=data_signature,
+        )
+        res_wl = None
+
+        if compare_wl:
+            with st.spinner("Simulating with watchlist additions..."):
+                try:
+                    res_wl = _run_stage4_backtest_once(
+                        int(years), True, include_closed, market_db, txs_json, holdings_json)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Watchlist comparison unavailable: {e}")
+                    return
+
+            save_backtest_result(
+                res_wl,
+                cache_dir=cache_dir,
+                person_id=person_id,
+                years=years_int,
+                compare_watchlist=True,
+                include_closed=include_closed_bool,
+                data_signature=data_signature,
+            )
 
     skipped = res_main.get("universe", {}).get("skipped_tickers", [])
     if skipped:

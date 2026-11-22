@@ -32,14 +32,19 @@ max(0, real-ledger net buy inflow); index benchmarks (^NSEI / ^CRSLDX) accrue a
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from performance import backtest_data as bd
 from performance.stage4_signals import (
     CONCENTRATION_TRIM,
     DMA_LONG,
+    GTT_STOP_LOSS,
     HARD_STOP_LOSS,
     LAGGARD_EXIT,
     TRIM_AER,
@@ -74,6 +79,169 @@ WATCHLIST_MAX_YEARS = 3        # watchlist stocks may only activate in the last 
 
 VALID_YEARS = (3, 4, 5, 6, 7)
 
+BACKTEST_CACHE_VERSION = 1
+BACKTEST_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "backtest_cache"
+
+
+def backtest_cache_dir(cache_dir: str | Path | None = None) -> Path:
+    """Return the persistent backtest cache directory."""
+    return Path(cache_dir) if cache_dir is not None else BACKTEST_CACHE_DIR
+
+
+def backtest_cache_key(
+    person_id: int | str | None = None,
+    years: int = 7,
+    compare_watchlist: bool = False,
+    include_closed: bool = True,
+    *,
+    horizon_years: int | None = None,
+) -> str:
+    """Build a deterministic cache key from run settings."""
+    effective_years = int(horizon_years if horizon_years is not None else years)
+    payload = json.dumps(
+        {
+            "person_id": str(person_id or ""),
+            "horizon_years": effective_years,
+            "compare_watchlist": bool(compare_watchlist),
+            "include_closed": bool(include_closed),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_backtest_data_signature(
+    market_db_path: str | None = None, txs: list[dict] | None = None
+) -> str:
+    """Hash the latest cached price date and transaction-ledger state."""
+    db = bd._default_db(market_db_path)
+    latest_price_date = None
+    try:
+        with sqlite3.connect(db) as conn:
+            row = conn.execute("SELECT MAX(trade_date) FROM stock_prices").fetchone()
+            latest_price_date = row[0] if row else None
+    except Exception:  # noqa: BLE001
+        latest_price_date = None
+
+    latest_trade_date = None
+    for tx in txs or []:
+        raw_date = tx.get("trade_date") or tx.get("date") or tx.get("settlement_date")
+        if raw_date:
+            trade_date = str(raw_date)[:10]
+            latest_trade_date = trade_date if not latest_trade_date else max(latest_trade_date, trade_date)
+
+    payload = json.dumps(
+        {
+            "latest_price_date": str(latest_price_date or ""),
+            "transaction_count": len(txs or []),
+            "latest_trade_date": str(latest_trade_date or ""),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def save_backtest_result(
+    result: dict,
+    *,
+    cache_dir: str | Path | None = None,
+    person_id: int | str | None = None,
+    years: int = 7,
+    compare_watchlist: bool = False,
+    include_closed: bool = True,
+    data_signature: str | None = None,
+    saved_at: str | None = None,
+) -> Path:
+    """Persist a backtest result together with lightweight run metadata."""
+    directory = backtest_cache_dir(cache_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    key = backtest_cache_key(
+        person_id,
+        years=years,
+        compare_watchlist=compare_watchlist,
+        include_closed=include_closed,
+    )
+    metadata = {
+        "version": BACKTEST_CACHE_VERSION,
+        "key": key,
+        "person_id": str(person_id or ""),
+        "years": int(years),
+        "compare_watchlist": bool(compare_watchlist),
+        "include_closed": bool(include_closed),
+        "data_signature": data_signature or compute_backtest_data_signature(),
+        "saved_at": saved_at or datetime.now().astimezone().isoformat(),
+    }
+    payload = {"version": BACKTEST_CACHE_VERSION, "metadata": metadata, "result": result}
+    path = directory / f"backtest_{key}.json"
+    path.write_text(
+        json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return path
+
+
+def load_backtest_cache(
+    cache_dir: str | Path | None = None,
+    *,
+    person_id: int | str | None = None,
+    years: int = 7,
+    compare_watchlist: bool = False,
+    include_closed: bool = True,
+) -> tuple[dict | None, dict | None]:
+    """Load one saved backtest result and its metadata, if present and valid."""
+    directory = backtest_cache_dir(cache_dir)
+    key = backtest_cache_key(
+        person_id,
+        years=years,
+        compare_watchlist=compare_watchlist,
+        include_closed=include_closed,
+    )
+    path = directory / f"backtest_{key}.json"
+    if not path.is_file():
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None, None
+        metadata = payload.get("metadata")
+        result = payload.get("result")
+        if not isinstance(metadata, dict) or not isinstance(result, dict):
+            return None, None
+        if metadata.get("version") != BACKTEST_CACHE_VERSION or metadata.get("key") != key:
+            return None, None
+        return result, metadata
+    except (OSError, TypeError, ValueError):
+        return None, None
+
+
+def load_backtest_result(
+    cache_dir: str | Path | None = None,
+    *,
+    person_id: int | str | None = None,
+    years: int = 7,
+    compare_watchlist: bool = False,
+    include_closed: bool = True,
+    data_signature: str | None = None,
+) -> dict | None:
+    """Load a backtest result after validating cache schema and data freshness."""
+    result, metadata = load_backtest_cache(
+        cache_dir,
+        person_id=person_id,
+        years=years,
+        compare_watchlist=compare_watchlist,
+        include_closed=include_closed,
+    )
+    if result is None or metadata is None:
+        return None
+    if data_signature is not None and metadata.get("data_signature") != data_signature:
+        return None
+    return result
+
+
 # Diagnostic-only sell-reason ordering for the Stage 4E audit table.
 # HARD_STOP_LOSS / LAGGARD_EXIT / CONCENTRATION_TRIM are the strategy rules;
 # GTT_STOP_LOSS is the price-based dynamic stop (now evaluated monthly-only on
@@ -85,7 +253,7 @@ SELL_REASON_ORDER = (
     HARD_STOP_LOSS,
     LAGGARD_EXIT,
     CONCENTRATION_TRIM,
-    "GTT_STOP_LOSS",
+    GTT_STOP_LOSS,
     "CATASTROPHE_GTT",
 )
 
@@ -962,7 +1130,7 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
             continue  # market crash freeze (Nifty 52w DD < -20%) -> hold through crash
         if not _gtt_stop_allowed(st, cmp_gtt, prices, d, rd):
             continue  # broad-market pullback -> hold healthy names
-        cash += _book_proceeds(_apply_sell(st, d, cmp_gtt, 1.0, tax_state, stats, "GTT_STOP_LOSS"), d, rd)
+        cash += _book_proceeds(_apply_sell(st, d, cmp_gtt, 1.0, tax_state, stats, GTT_STOP_LOSS), d, rd)
         st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
         st.frozen = True
 
