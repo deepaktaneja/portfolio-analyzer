@@ -21,7 +21,13 @@ def _backtest_report_date(value: Any) -> str:
     s = str(value).strip()
     if not s:
         return "--"
-    return s[:10]
+    # Try to parse as ISO date (YYYY-MM-DD); if it looks like a file path,
+    # return it as-is instead of truncating to a meaningless prefix.
+    try:
+        _dt.date.fromisoformat(s[:10])
+        return s[:10]
+    except (ValueError, TypeError):
+        return s
 
 def _backtest_report_inr(value: Any) -> str:
     try:
@@ -39,7 +45,7 @@ def _backtest_report_pct(value: Any) -> str:
         f = float(value)
     except (TypeError, ValueError):
         return "--"
-    return f"{f * 100.0:.2f}%"
+    return f"{f:.2f}%"
 
 def _backtest_report_ratio(value: Any) -> str:
     if value is None:
@@ -133,16 +139,11 @@ def build_backtest_markdown_report(
         ]
     )
 
-    def _horizon_to_str(hor: int) -> str:
-        try:
-            return str(int(hor))
-        except (TypeError, ValueError):
-            return str(hor)
-
-    def _make_scorecard_row(horizon_result: dict) -> list[str]:
+    def _make_scorecard_row(horizon: int, horizon_result: dict) -> list[str]:
         if not isinstance(horizon_result, dict):
             return [
-                _horizon_to_str(horizon_result),
+                f"{horizon}Y",
+                "N/A",
                 "N/A",
                 "N/A",
                 "N/A",
@@ -161,7 +162,7 @@ def build_backtest_markdown_report(
         n500 = bench.get("nifty500", {})
         ew = bench.get("equal_weight", {})
         return [
-            _horizon_to_str(horizon_result),
+            f"{horizon}Y",
             _backtest_report_inr(sc.get("invested")),
             _backtest_report_inr(sc.get("realized_sells")),
             _backtest_report_inr(sc.get("final_net_value")),
@@ -178,7 +179,7 @@ def build_backtest_markdown_report(
     scorecard_rows: list[list[str]] = []
     for horizon in horizons:
         res = results.get(horizon) or results.get(str(horizon)) or {}
-        scorecard_rows.append(_make_scorecard_row(res))
+        scorecard_rows.append(_make_scorecard_row(horizon, res))
 
     lines.append(
         _backtest_report_markdown_table(
