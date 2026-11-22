@@ -7,6 +7,19 @@ from datetime import UTC, datetime
 from src.store import SQLiteStore
 
 
+def _normalize_tx_date(value) -> str:
+    """Normalize transaction dates to a ``YYYY-MM-DD`` string."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return s[:10]
+
+
 class PersonStore(SQLiteStore):
     def migrate(self) -> None:
         super().migrate()
@@ -112,6 +125,39 @@ class PersonStore(SQLiteStore):
         with self._conn() as conn:
             rows = conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
+
+    def _transaction_key(self, row: dict) -> tuple[str, str, str, float]:
+        trade_date = _normalize_tx_date(row.get("trade_date") or row.get("settlement_date"))
+        isin = str(row.get("isin") or row.get("security") or "").strip().upper()
+        stock_code = str(row.get("stock_code") or row.get("security") or row.get("isin") or "").strip().upper()
+        quantity = float(row.get("quantity") or 0)
+        return (trade_date, isin, stock_code, quantity)
+
+    def partition_new_transactions(
+        self,
+        rows: list[dict],
+        person_id: int | None = None,
+        exclude_source_file: str | None = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """Split incoming transactions into new and duplicate rows."""
+        existing_rows = self.all_transactions(person_id=person_id)
+        existing_keys: set[tuple[str, str, str, float]] = set()
+        for t in existing_rows or []:
+            if exclude_source_file and str(t.get("source_file") or "") == exclude_source_file:
+                continue
+            existing_keys.add(self._transaction_key(t))
+
+        new_rows: list[dict] = []
+        duplicate_rows: list[dict] = []
+        seen: set[tuple[str, str, str, float]] = set()
+        for row in rows or []:
+            key = self._transaction_key(row)
+            if key in seen or key in existing_keys:
+                duplicate_rows.append(row)
+                continue
+            seen.add(key)
+            new_rows.append(row)
+        return new_rows, duplicate_rows
 
     def add_portfolio_snapshot(self, source_file, as_of_date, detected_type, holdings, person_id=None) -> int:
         with self._conn() as conn:

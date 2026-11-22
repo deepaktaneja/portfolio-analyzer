@@ -52,6 +52,40 @@ def test_unassigned_filter(tmp_path):
     assert len(s.all_transactions(-1)) == 1
 
 
+def test_partition_new_transactions_skips_duplicates(tmp_path):
+    s = _store(tmp_path)
+    pid = s.create_person("A")
+    existing = {
+        "trade_date": "2024-01-01",
+        "isin": "INE001",
+        "security": "X",
+        "buy_sell": "BUY",
+        "quantity": 2,
+        "source_file": "old.pdf",
+    }
+    s.replace_file_transactions("old.pdf", [existing], person_id=pid)
+
+    new_rows, duplicates = s.partition_new_transactions(
+        [dict(existing, source_file="new.pdf")], person_id=pid
+    )
+    assert new_rows == []
+    assert len(duplicates) == 1
+
+    within = {
+        "trade_date": "2024-02-01",
+        "isin": "INE002",
+        "security": "Y",
+        "buy_sell": "BUY",
+        "quantity": 1,
+        "source_file": "new.pdf",
+    }
+    new_rows, duplicates = s.partition_new_transactions(
+        [within, dict(within)], person_id=pid
+    )
+    assert len(new_rows) == 1
+    assert len(duplicates) == 1
+
+
 def test_holdings_snapshot_per_person(tmp_path):
     s = _store(tmp_path)
     a = s.create_person("A")

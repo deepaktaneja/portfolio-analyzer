@@ -947,7 +947,7 @@ def _render_people(ctx: AppContext) -> None:
                     nn = _norm_name(nm)
                     if len(nn) >= 4:
                         held_names.add(nn)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110
             pass
         return held_keys, held_isins, held_names
 
@@ -965,11 +965,32 @@ def _render_people(ctx: AppContext) -> None:
         s = st.session_state.get("_import_summary")
         if not s:
             return
-        msg = ("Uploaded " + str(s["files_ok"]) + "/" + str(s["files_total"]) + " file(s); imported "
-               + str(s["imported"]) + " transactions for " + str(s["person"]))
-        if s["imported"] and s["companies"]:
-            msg += " across " + str(s["companies"]) + " security(ies)"
-        st.success(msg + ".")
+        msg = ("✅ Uploaded " + str(s["imported"]) + " new transactions | "
+               "⚠️ Skipped " + str(s.get("skipped", 0)) + " duplicate transactions.")
+        if s.get("skipped"):
+            st.warning(msg)
+        else:
+            st.success(msg)
+        duplicates = s.get("duplicates") or []
+        if duplicates:
+            st.warning("Duplicate transactions skipped:")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Date": str(r.get("trade_date") or r.get("settlement_date") or "")[:10],
+                            "Stock Code": str(r.get("security") or r.get("isin") or ""),
+                            "ISIN": str(r.get("isin") or ""),
+                            "Type": str(r.get("buy_sell") or ""),
+                            "Quantity": float(r.get("quantity") or 0),
+                            "Price": float(r.get("gross_rate") or r.get("price") or 0),
+                        }
+                        for r in duplicates
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
         if s.get("filter_note"):
             st.caption(s["filter_note"])
         st.dataframe(pd.DataFrame(s["files"]), hide_index=True, width="stretch")
@@ -1019,29 +1040,36 @@ def _render_people(ctx: AppContext) -> None:
         progress.progress(0.95, text="Saving to database…")
         imported, filtered_out, companies = 0, 0, set()
         excluded_names = set()
+        duplicates: list[dict] = []
+        skipped = 0
         for p in parsed:
             rows = p["rows"]
+            new_rows, duplicate_rows = store.partition_new_transactions(
+                rows, person_id=pid, exclude_source_file=p["key"]
+            )
+            skipped += len(duplicate_rows)
+            duplicates.extend(duplicate_rows)
             if only_closed:
                 kept = []
-                for r in rows:
+                for r in new_rows:
                     if _is_held(r, held_keys, held_isins, held_names):
                         excluded_names.add(_row_key(r))
                     else:
                         kept.append(r)
-                filtered_out += len(rows) - len(kept)
-                rows = kept
-            store.replace_file_transactions(p["key"], rows, person_id=pid)
+                filtered_out += len(new_rows) - len(kept)
+                new_rows = kept
+            store.replace_file_transactions(p["key"], new_rows, person_id=pid)
             try:
-                store.upsert_file(p["key"], os.path.getmtime(p["dest"]), len(rows))
-            except Exception:  # noqa: BLE001
+                store.upsert_file(p["key"], os.path.getmtime(p["dest"]), len(new_rows))
+            except Exception:  # noqa: BLE001, S110
                 pass
-            imported += len(rows)
-            for r in rows:
+            imported += len(new_rows)
+            for r in new_rows:
                 k = _row_key(r)
                 if k:
                     companies.add(k)
-            p["rep"]["Imported"] = len(rows)
-            p["rep"]["Status"] = "✅ Imported" if rows else "⏭️ No rows kept"
+            p["rep"]["Imported"] = len(new_rows)
+            p["rep"]["Status"] = "✅ Imported" if new_rows else "⏭️ No rows kept"
 
         _clear_data_caches()
         progress.progress(1.0, text="Complete.")
@@ -1054,6 +1082,8 @@ def _render_people(ctx: AppContext) -> None:
             "files_total": n,
             "files_ok": sum(1 for r in reports if r["Status"].startswith("✅")),
             "imported": imported,
+            "skipped": skipped,
+            "duplicates": duplicates,
             "companies": len(companies),
             "filter_note": filter_note,
             "files": reports,
@@ -1098,8 +1128,8 @@ def _render_people(ctx: AppContext) -> None:
         st.caption("For every security with sells but missing buys, inserts a synthetic BUY dated 2014-01-01 priced at the 2014-01-01 Yahoo close. Securities without a 2014 price can be dropped.")
         drop_unpriced = st.checkbox("Drop securities with no 2014 price", value=False, key="u2014_drop")
         if st.button("Set 1 Jan 2014 as buy date for unmatched sells", key="u2014_run"):
-            from src.unmatched_remediation import set_2014_buy_date
             from app.context import DEFAULT_MARKET_DB, _xirr_db
+            from src.unmatched_remediation import set_2014_buy_date
             bar = st.progress(0.0, text="Fetching 2014 prices...")
             def _prog(done, total, key):
                 bar.progress(min(1.0, (done / total) if total else 1.0), text="Pricing " + str(done) + "/" + str(total) + ": " + str(key))
