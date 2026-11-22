@@ -1903,6 +1903,82 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         st.info("No active equity holdings to plan for.")
         return
 
+    # ---- Missing price-history banner ---------------------------------------
+    # Check which active tickers lack sufficient price history in the local DB.
+    # New stocks (recently bought or added to watchlist) often have no rows yet,
+    # which causes Stage 4C to show N/A and allocate zero SIP.
+    if "s4c_price_fetch_failed" not in st.session_state:
+        st.session_state["s4c_price_fetch_failed"] = set()
+    _price_fetch_failed = set(st.session_state["s4c_price_fetch_failed"])
+
+    _missing_price_tickers: list[str] = []
+    _db_path_val = ctx.market_db_path
+    try:
+        from market_data.prices import _MIN_TRADING_DAYS, _ticker_row_count
+        for sid in active_isins:
+            if sid in _price_fetch_failed:
+                continue
+            try:
+                if _ticker_row_count(sid, _db_path_val) < _MIN_TRADING_DAYS:
+                    _missing_price_tickers.append(sid)
+            except Exception:  # noqa: BLE001
+                _missing_price_tickers.append(sid)
+    except Exception:  # noqa: BLE001
+        _missing_price_tickers = []
+
+    if _missing_price_tickers:
+        _missing_label = ", ".join(_missing_price_tickers)
+        st.warning(
+            f"Price history not yet imported for: {_missing_label}. "
+            "These stocks will show N/A and receive no SIP allocation until history is fetched."
+        )
+        _fb_col, _dismiss_col = st.columns([3, 1])
+        with _fb_col:
+            if st.button(
+                "Fetch Missing Price History",
+                key="s4c_fetch_missing_prices",
+                type="primary",
+                use_container_width=True,
+            ):
+                from market_data.prices import ensure_price_history
+
+                with st.spinner(
+                    f"Fetching price history for {len(_missing_price_tickers)} ticker(s)..."
+                ):
+                    _res = ensure_price_history(
+                        _missing_price_tickers, db_path=_db_path_val
+                    )
+                if _res["fetched"]:
+                    st.success(
+                        "Imported price history for: "
+                        + ", ".join(_res["fetched"])
+                    )
+                if _res["failed"]:
+                    st.session_state["s4c_price_fetch_failed"].update(_res["failed"])
+                    _price_fetch_failed.update(_res["failed"])
+                    st.error(
+                        "Failed to fetch: "
+                        + ", ".join(_res["failed"])
+                        + ". Check the symbol mapping in Data & Settings."
+                    )
+                if _res["missing"]:
+                    st.info(
+                        "No symbol mapping for: "
+                        + ", ".join(_res["missing"])
+                        + ". Add a mapping in Data & Settings, then retry."
+                    )
+                # Clear Stage 4C cache so the table rebuilds with fresh prices
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("s4c_rows"):
+                        del st.session_state[_k]
+                st.rerun()
+        with _dismiss_col:
+            if st.button("Dismiss", key="s4c_dismiss_price_banner"):
+                st.session_state["s4c_price_fetch_failed"].update(
+                    _missing_price_tickers
+                )
+                st.rerun()
+
     if "s4c_excluded_tickers" not in st.session_state:
         st.session_state["s4c_excluded_tickers"] = set()
     _excluded_now = set(st.session_state["s4c_excluded_tickers"])
@@ -2099,6 +2175,14 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                     "invested_cost": 0.0,
                 }
                 st.session_state["s4c_incubation_entries"] = inc_entries
+                # Auto-backfill price history for the newly added ticker so
+                # Stage 4C can compute signals without showing N/A.
+                try:
+                    from market_data.prices import ensure_price_history
+
+                    ensure_price_history([_ticker], db_path=ctx.market_db_path)
+                except Exception:  # noqa: BLE001, S110
+                    pass
                 st.rerun()
         except Exception as _e:  # noqa: BLE001
             st.error(f"Could not simulate {_ticker}: {_e}")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import time
 from datetime import date as _date
 
 from market_data.repository import MarketDataStore
@@ -88,6 +87,126 @@ def reset_price_fetch_cache() -> None:
     _FETCH_CACHE.clear()
     _FETCH_MISSES.clear()
     _LAST_FETCH_TS[0] = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Auto-backfill: ensure price history exists for a list of tickers
+# ---------------------------------------------------------------------------
+_MIN_TRADING_DAYS = 200          # minimum rows needed for DMA200 / volatility
+_FETCH_FAILED_TICKERS: set[str] = set()   # tickers that failed this session (in-process)
+
+
+def _ticker_row_count(ticker: str, db_path: str) -> int:
+    """Return the number of price rows stored for ``ticker`` in the local DB."""
+    store = _store(db_path)
+    try:
+        with store._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM stock_prices WHERE UPPER(security_id)=?",
+                (ticker.strip().upper(),),
+            ).fetchone()
+            return int(row[0]) if row else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _ticker_has_symbol_map(ticker: str, db_path: str) -> bool:
+    """Return True if a Yahoo provider symbol mapping exists for ``ticker``."""
+    store = _store(db_path)
+    try:
+        rows = store.get_security_symbol_map(security_id=ticker)
+        return bool(rows)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def ensure_price_history(
+    tickers: list[str],
+    db_path: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict:
+    """Ensure price history exists for the given tickers in the local DB.
+
+    Checks which tickers lack sufficient price history (< ``_MIN_TRADING_DAYS``
+    rows) and fetches only those missing tickers via :func:`fetch_stock_prices`.
+    Tickers that already have enough history are skipped. Tickers that fail to
+    fetch are recorded in the in-process ``_FETCH_FAILED_TICKERS`` set so they
+    are not retried on every rerun within the same session.
+
+    Parameters
+    ----------
+    tickers : list[str]
+        List of security IDs / tickers (ISIN or NSE ticker, e.g. ``RELIANCE.NS``).
+    db_path : str | None
+        Path to the local market-data SQLite DB. Defaults to ``DEFAULT_MARKET_DB``.
+    start : str | None
+        Fetch start date (``YYYY-MM-DD``). Defaults to ~3 years ago.
+    end : str | None
+        Fetch end date (``YYYY-MM-DD``). Defaults to today.
+
+    Returns
+    -------
+    dict
+        ``{"fetched": [...], "skipped": [...], "failed": [...], "missing": [...]}``
+        where each value is a list of ticker strings.
+    """
+    db = _db_path(db_path)
+    end_iso = _iso(end) or _iso(_date.today())
+    start_iso = _iso(start) or str(
+        _date.fromordinal(_date.today().toordinal() - 3 * 365)
+    )
+
+    results = {"fetched": [], "skipped": [], "failed": [], "missing": []}
+
+    for ticker in tickers or []:
+        ticker = str(ticker).strip().upper()
+        if not ticker:
+            continue
+
+        # Skip tickers that already failed this session
+        if ticker in _FETCH_FAILED_TICKERS:
+            results["failed"].append(ticker)
+            continue
+
+        # Skip if already has sufficient history
+        try:
+            row_count = _ticker_row_count(ticker, db)
+            if row_count >= _MIN_TRADING_DAYS:
+                results["skipped"].append(ticker)
+                continue
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+        # No symbol mapping -> cannot fetch
+        if not _ticker_has_symbol_map(ticker, db):
+            results["missing"].append(ticker)
+            continue
+
+        # Fetch missing history
+        if not price_fetch_enabled():
+            results["missing"].append(ticker)
+            continue
+
+        try:
+            res = fetch_stock_prices(
+                ticker,
+                start=start_iso,
+                end=end_iso,
+                db_path=db,
+                symbol=ticker,
+                persist=True,
+            )
+            if int(res.get("rows_fetched") or 0) > 0:
+                results["fetched"].append(ticker)
+            else:
+                _FETCH_FAILED_TICKERS.add(ticker)
+                results["failed"].append(ticker)
+        except Exception:  # noqa: BLE001
+            _FETCH_FAILED_TICKERS.add(ticker)
+            results["failed"].append(ticker)
+
+    return results
 
 
 def resolve_provider_symbol(security_id, db_path=None, provider=None):
@@ -537,7 +656,8 @@ def get_sync_run(run_id=None, db_path=None):
 
 
 def get_missing_benchmark_dates(benchmark, start, end, db_path=None):
-    from datetime import date as _d, timedelta as _td
+    from datetime import date as _d
+    from datetime import timedelta as _td
     store = _store(db_path)
     iid = str(benchmark).strip().upper()
     try:
@@ -582,7 +702,7 @@ def sync_benchmark_history(benchmark, start, end, db_path=None, source_url=None,
     )
     try:
         return sync_index_tri(benchmark, start=start, end=end, db_path=db_path, source_url=source_url, path=path, index_name=index_name)
-    except Exception as official_err:  # noqa: BLE001
+    except Exception as official_err:
         if path or source_url:
             raise
         if use_archive:

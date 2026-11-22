@@ -277,3 +277,105 @@ def test_fetch_stock_prices_falls_back_when_first_provider_fails(tmp_path, monke
     assert res["upserted"] == 1
     assert any("429" in err for err in res["errors"])
     assert MarketDataStore(db).get_stock_price("INE001A01036", "2015-06-01") == 77.0
+
+
+def _seed_many_prices(db, ticker, n=250, start="2023-01-01"):
+    """Seed ``n`` price rows for ``ticker`` so it passes the _MIN_TRADING_DAYS check."""
+    from datetime import date as _d
+    from datetime import timedelta as _td
+    rows = []
+    d = _d.fromisoformat(start)
+    for i in range(n):
+        rows.append({
+            "security_id": ticker,
+            "exchange": "NSE",
+            "trade_date": (d + _td(days=i)).isoformat(),
+            "close_price": 100.0 + i,
+            "source": "seed",
+        })
+    MarketDataStore(db).upsert_stock_prices(rows)
+
+
+def test_ensure_price_history_skips_cached(tmp_path, monkeypatch):
+    """ensure_price_history should skip tickers that already have sufficient history."""
+    db = str(tmp_path / "md.sqlite3")
+    _seed_mapping(db, "INE001A01036", "ABC.NS")
+    _seed_many_prices(db, "INE001A01036", n=250)  # >= _MIN_TRADING_DAYS
+
+    fetched = []
+    original_fetch = prices.fetch_stock_prices
+
+    def _tracking_fetch(*args, **kwargs):
+        fetched.append(args[0] if args else kwargs.get("security_id"))
+        return original_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(prices, "fetch_stock_prices", _tracking_fetch)
+
+    res = prices.ensure_price_history(["INE001A01036"], db_path=db)
+    assert res["skipped"] == ["INE001A01036"]
+    assert res["fetched"] == []
+    assert fetched == []  # fetch_stock_prices must NOT be called for cached ticker
+
+
+def test_ensure_price_history_fetches_missing(tmp_path, monkeypatch):
+    """ensure_price_history should fetch only tickers missing from the DB."""
+    db = str(tmp_path / "md.sqlite3")
+    _seed_mapping(db, "INE001A01036", "ABC.NS")
+    _seed_mapping(db, "INE002A01018", "XYZ.NS")
+    _seed_many_prices(db, "INE001A01036", n=250)  # cached
+    # INE002A01018 has no rows -> should be fetched
+
+    fetch_calls = []
+
+    def _fake_fetch(security_id, start=None, end=None, db_path=None, **kwargs):
+        fetch_calls.append(security_id)
+        if security_id == "INE002A01018":
+            return {
+                "security_id": security_id,
+                "symbol": "XYZ.NS",
+                "rows_fetched": 5,
+                "upserted": 5,
+                "prices": [("2023-01-01", 100.0), ("2023-01-02", 101.0),
+                           ("2023-01-03", 102.0), ("2023-01-04", 103.0),
+                           ("2023-01-05", 104.0)],
+                "errors": [],
+            }
+        return {"security_id": security_id, "rows_fetched": 0, "prices": [], "errors": ["no rows"]}
+
+    monkeypatch.setattr(prices, "fetch_stock_prices", _fake_fetch)
+
+    res = prices.ensure_price_history(
+        ["INE001A01036", "INE002A01018"], db_path=db
+    )
+    assert res["skipped"] == ["INE001A01036"]
+    assert res["fetched"] == ["INE002A01018"]
+    assert fetch_calls == ["INE002A01018"]  # only missing ticker was fetched
+
+
+def test_ensure_price_history_tracks_failures(tmp_path, monkeypatch):
+    """ensure_price_history should record failed tickers and not retry them."""
+    db = str(tmp_path / "md.sqlite3")
+    _seed_mapping(db, "INE001A01036", "ABC.NS")
+    # INE001A01036 has no price rows but symbol mapping exists
+
+    def _boom_fetch(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(prices, "fetch_stock_prices", _boom_fetch)
+    prices._FETCH_FAILED_TICKERS.clear()
+
+    res1 = prices.ensure_price_history(["INE001A01036"], db_path=db)
+    assert res1["failed"] == ["INE001A01036"]
+    assert "INE001A01036" in prices._FETCH_FAILED_TICKERS
+
+    # Second call should not retry (ticker is in failed set)
+    fetch_calls = []
+    def _tracking_fetch(*args, **kwargs):
+        fetch_calls.append(args[0] if args else kwargs.get("security_id"))
+        return {"security_id": args[0] if args else kwargs.get("security_id"),
+                "rows_fetched": 0, "prices": [], "errors": []}
+
+    monkeypatch.setattr(prices, "fetch_stock_prices", _tracking_fetch)
+    res2 = prices.ensure_price_history(["INE001A01036"], db_path=db)
+    assert res2["failed"] == ["INE001A01036"]
+    assert fetch_calls == []  # not retried
