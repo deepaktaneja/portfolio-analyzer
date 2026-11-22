@@ -1391,6 +1391,125 @@ def _render_playbook_panel(live: dict) -> None:
         st.code(md, language="markdown")
 
 
+def _stage4_unified_sip_allocate(
+    rows,
+    watchlist_entries,
+    base_unit_sip: float,
+    max_budget_ceiling: float,
+    max_single_stock_sip: float | None = None,
+    granularity: float = 5000.0,
+) -> dict:
+    """Unify graduated + eligible incubating SIP demand into one pro-rata pool.
+
+    Every eligible incubating stock (< Rs 1,00,000 invested, not paused / excluded)
+    is treated as a standard 1.0x base-unit holding. Graduated holdings keep their
+    own lane multiplier. When the combined natural SIP demand exceeds the ceiling,
+    the exact pro-rata scale factor is applied to every stock (graduated + incubating).
+    """
+    from performance import stage4_signals as s4
+
+    ceiling = max(0.0, float(max_budget_ceiling or 0.0))
+    base = max(0.0, float(base_unit_sip or 0.0))
+    gran = float(granularity) if granularity and granularity > 0 else 0.0
+    cap = float(max_single_stock_sip or 0.0)
+    run_up_limit = float(getattr(s4, "SIP_RUN_UP_DMA_DISTANCE", 0.30) or 0.30) or 0.30
+    inc_max_invested = float(getattr(s4, "INCUBATION_MAX_INVESTED", 100000.0) or 100000.0) or 100000.0
+
+    def _snap(v) -> float:
+        return math.floor(float(v) / gran) * gran if gran else float(v)
+
+    def _cap(v: float) -> float:
+        if cap and cap > 0:
+            return min(float(v), (math.floor(cap / gran) * gran) if gran else cap)
+        return float(v)
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    def _key(r: dict) -> str:
+        for k in ("security_id", "ticker", "nse_ticker", "isin", "symbol"):
+            v = r.get(k)
+            if v:
+                return str(v).strip().upper()
+        return ""
+
+    def _add(r: dict, stage: str) -> None:
+        k = _key(r)
+        if k and k in seen:
+            return
+        if k:
+            seen.add(k)
+        c = dict(r)
+        if stage == "Incubating":
+            c["security_id"] = str(c.get("security_id") or c.get("ticker") or c.get("nse_ticker") or c.get("isin") or c.get("symbol") or "")
+        c["stage"] = stage
+        excluded = bool(c.get("excluded") or c.get("is_excluded") or c.get("exclude") or False)
+        if stage == "Incubating":
+            c["incubation"] = True
+            invested = float(c.get("invested_cost") or 0.0)
+            dist = c.get("dma200_distance_pct")
+            dist_val = float(dist) if dist is not None else None
+            eligible = (
+                not excluded
+                and not bool(c.get("missing"))
+                and invested < inc_max_invested
+                and dist_val is not None
+                and dist_val >= 0.0
+                and dist_val <= run_up_limit
+            )
+            mult = 1.0 if eligible else 0.0
+            c["excluded"] = excluded
+            c["sip_multiplier"] = mult
+            c["natural_sip"] = _cap(_snap(mult * base)) if mult > 0 else 0.0
+            c["sip_reason"] = c.get("sip_reason") or (
+                "Incubating (< ₹1L) – Healthy trend" if eligible else "Incubating (< ₹1L) – Paused / Excluded"
+            )
+        else:
+            c["incubation"] = False
+            c["excluded"] = excluded
+            mult = 0.0 if excluded else float(c.get("sip_multiplier") or 0.0)
+            c["sip_multiplier"] = mult
+            c["natural_sip"] = _cap(_snap(mult * base)) if mult > 0 else 0.0
+        candidates.append(c)
+
+    for r in rows or []:
+        _add(r, "Incubating" if r.get("incubation") else "Graduated")
+    for e in watchlist_entries or []:
+        _add(e, "Incubating")
+
+    total_natural = sum(float(c.get("natural_sip") or 0.0) for c in candidates)
+    scaled_down = False
+    if total_natural > ceiling and total_natural > 0:
+        scale = ceiling / total_natural
+        for c in candidates:
+            natural = float(c.get("natural_sip") or 0.0)
+            scaled = _cap(_snap(natural * scale)) if natural > 0 else 0.0
+            c["recommended_sip_rupees"] = scaled
+            cmp_val = float(c.get("cmp") or 0.0)
+            c["est_shares"] = int(scaled // cmp_val) if cmp_val > 0 else 0
+        allocated = sum(float(c.get("recommended_sip_rupees") or 0.0) for c in candidates)
+        scaled_down = True
+    else:
+        for c in candidates:
+            c["recommended_sip_rupees"] = float(c.get("natural_sip") or 0.0)
+            cmp_val = float(c.get("cmp") or 0.0)
+            c["est_shares"] = int(float(c.get("recommended_sip_rupees") or 0.0) // cmp_val) if cmp_val > 0 else 0
+        allocated = total_natural
+
+    parked_cash = max(0.0, ceiling - allocated)
+    return {
+        "rows": candidates,
+        "deployable_budget": ceiling,
+        "natural_total_sip": total_natural,
+        "total_allocated": allocated,
+        "parked_cash": parked_cash,
+        "unspent_budget": parked_cash,
+        "scaled_down": scaled_down,
+        "all_frozen": allocated <= 0,
+        "carry_forward_cash": 0.0,
+    }
+
+
 def _render_stage4_action_center(ctx: AppContext) -> None:
     """Stage 4B - Sell / Profit-Booking / Stop-Loss Action Center (UI)."""
     from datetime import date as _d
@@ -1506,7 +1625,7 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
             regime, mult = "Crash Freeze (2.0x)", 2.0
             st.error("⚠️ Crash Freeze engaged: defensive exits paused.")
         st.markdown(f"**Regime:** {regime}")
-        base_tranche = st.number_input("Base Monthly Tranche (Rs)", min_value=50000, value=750000, step=25000)
+        base_tranche = st.number_input("Base Monthly Tranche (Rs)", min_value=50000, value=500000, step=25000)
         monthly_ceiling = base_tranche * mult
         expected_sell_proceeds = 0.0
         net_redemption = 0.0
@@ -1524,14 +1643,15 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
                 taxp = s4.fifo_tax_preview(txs, r["security_id"], sh, cmp_, as_of,
                                            opening_positions=ctx.opening_positions)
                 expected_sell_proceeds += float(taxp["net_cash_unlocked"])
-        alloc = s4.compute_bottom_up_sip_allocation(
-            rows, None,
-            base_unit_sip=float(st.session_state.get("s4c_base_unit_sip", s4.BASE_UNIT_SIP)),
-            max_budget_ceiling=float(st.session_state.get("s4c_budget", s4.DEFAULT_MONTHLY_SIP_BUDGET)),
-            max_single_stock_sip=float(st.session_state.get("s4c_max_sip", s4.MAX_SINGLE_STOCK_SIP)),
+        _inc_entries_list = list(st.session_state.get("s4c_incubation_entries", {}).values())
+        alloc = _stage4_unified_sip_allocate(
+            rows, _inc_entries_list,
+            base_unit_sip=float(st.session_state.get("s4c_base_unit_sip", 25000)),
+            max_budget_ceiling=float(st.session_state.get("s4c_budget", 500000)),
+            max_single_stock_sip=float(st.session_state.get("s4c_max_sip", 65000)),
         )
         engine_buy_demand = float(alloc.get("total_allocated") or 0.0)
-        paused_count = sum(1 for r in rows if not r.get("incubation") and float(r.get("sip_multiplier") or 0.0) == 0.0)
+        paused_count = sum(1 for r in (alloc.get("rows") or []) if not r.get("incubation") and float(r.get("sip_multiplier") or 0.0) == 0.0)
         net_redemption = max(0.0, min(monthly_ceiling, engine_buy_demand) - expected_sell_proceeds)
 
         c1 = st.columns(4)
@@ -1712,8 +1832,8 @@ def _rehydrate_incubation_entries(ctx: AppContext, as_of) -> dict:
                 si, s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0), 0.12)
             starter = s4.incubation_starter_sip(
                 m,
-                base_unit_sip=float(st.session_state.get("s4c_base_unit_sip", s4.BASE_UNIT_SIP)),
-                max_single_stock_sip=float(st.session_state.get("s4c_max_sip", s4.MAX_SINGLE_STOCK_SIP)),
+                base_unit_sip=10000.0,
+                max_single_stock_sip=35000.0,
             )
             base.update({
                 "cmp": m.get("cmp") or series[-1],
@@ -1750,17 +1870,17 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     c0, c1, c2, c3 = st.columns([1.2, 2, 1, 1])
     with c0:
         base_unit_sip = st.number_input("Base Unit SIP (Rs)", min_value=5000, max_value=100000,
-                                        value=int(s4.BASE_UNIT_SIP), step=5000, key="s4c_base_unit_sip",
+                                        value=25000, step=5000, key="s4c_base_unit_sip",
                                         help="Natural lane SIP: 2.5x = 2.5x base, 1.0x = base, 0.5x = half base.")
     with c1:
         budget = st.number_input("Max Monthly Budget Ceiling (Rs)", min_value=0, max_value=50000000,
-                                 value=int(s4.DEFAULT_MONTHLY_SIP_BUDGET), step=25000, key="s4c_budget",
+                                 value=500000, step=25000, key="s4c_budget",
                                  help="MAXIMUM ceiling, not a target. If fewer stocks qualify the total SIP drops and the rest stays in cash.")
     with c2:
         include_harvest = st.checkbox("Include Harvested Cash (Stage 4B trims)", value=False,
                                       key="s4c_harvest")
     with c3:
-        max_single_stock_sip = st.number_input("Max Single-Stock SIP (Rs)", min_value=0, max_value=500000, value=int(s4.MAX_SINGLE_STOCK_SIP), step=5000, key="s4c_max_sip", help="Cap each stock monthly SIP; leftover parks in Liquid Fund.")
+        max_single_stock_sip = st.number_input("Max Single-Stock SIP (Rs)", min_value=0, max_value=500000, value=65000, step=5000, key="s4c_max_sip", help="Cap each stock monthly SIP; leftover parks in Liquid Fund.")
     max_single_stock_sip = float(max_single_stock_sip)
     base_unit_sip = float(base_unit_sip)
 
@@ -1838,7 +1958,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 harvested += float(tp["net_cash_unlocked"])
 
     _inc_entries_list = list(st.session_state.get("s4c_incubation_entries", {}).values())
-    alloc = s4.compute_bottom_up_sip_allocation(
+    alloc = _stage4_unified_sip_allocate(
         rows, _inc_entries_list,
         base_unit_sip=base_unit_sip,
         max_budget_ceiling=float(budget),
@@ -1862,7 +1982,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     if alloc.get("scaled_down"):
         st.info("Bottom-up natural SIP total " + inr(alloc.get("natural_total_sip", 0.0))
                 + " exceeds the ceiling " + inr(deploy)
-                + " - graduated stocks scaled down proportionally (Rs 5k multiples).")
+                + " - stocks scaled down proportionally (Rs 5k multiples).")
     else:
         st.caption("Natural lane SIPs total " + inr(alloc.get("natural_total_sip", allocated))
                    + ". Ceiling is a maximum, not a target - " + inr(parked)
@@ -1955,8 +2075,8 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 _m = s4.analyzeStockSignals(_si, _tot, 0.12)
                 _starter = s4.incubation_starter_sip(
                     _m,
-                    base_unit_sip=base_unit_sip,
-                    max_single_stock_sip=max_single_stock_sip,
+                    base_unit_sip=10000.0,
+                    max_single_stock_sip=35000.0,
                 )
                 _cmp = _m.get("cmp") or _series[-1]
                 _company = resolve_company_name(_ticker, nse_ticker=_ticker, db_path=ctx.market_db_path)
@@ -1998,7 +2118,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         _inc_label = _inc_miss.get("ticker") or _inc_miss.get("query") or _inc_miss.get("sid")
         _inc_query = _inc_miss.get("query") or _inc_miss.get("sid") or _inc_label
         st.warning(f"Price history is missing for {_inc_label} ({_inc_miss['start']} to {_inc_miss['end']}). "
-                   "Import it to add this stock to the incubation pacing table.")
+                   "Import it to add this stock to the incubation queue.")
         _imp_col, _can_col = st.columns([3, 1])
         with _imp_col:
             if st.button(f"Import price history & add {_inc_label}",
@@ -2018,40 +2138,6 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 st.session_state.pop("s4c_inc_missing", None)
                 st.rerun()
 
-    incubation_total = 0.0
-    inc_rows = []
-    if inc_entries:
-        st.markdown("**Incubation Pacing Table** (< ₹1,00,000 — staged deployment)")
-        for _tk in sorted(inc_entries):
-            _e = inc_entries[_tk]
-            _vol = _e["annual_volatility"]
-            _dist = _e["dma200_distance_pct"]
-            _sip = _e["starter_sip"]
-            incubation_total += _sip
-            _months = s4.months_to_graduate(_e["invested_cost"], _sip)
-            _badge_txt = {
-                "A": "🚀 Fast-Track ₹20k",
-                "B": "⚖️ Standard ₹10k",
-                "C": "🛡️ Toe-Hold ₹5k",
-            }.get(_e["tier"], _e["tier"])
-            _resolved = _e.get("name") or _name(_tk)
-            _company = _resolved if (_resolved and _resolved != _tk) else None
-            _isin_disp = _e.get("isin") or ""
-            inc_rows.append({
-                "Stock": _company or _tk,
-                "ISIN · NSE Ticker": (f"{_isin_disp} · {_tk}" if _isin_disp else _tk),
-                "CMP": f"{_e['cmp']:,.1f}" if _e.get("cmp") else "N/A",
-                "Vol %": f"{_vol * 100:.1f}%" if _vol is not None else "N/A",
-                "200-DMA Dist %": f"{_dist * 100:+.1f}%" if _dist is not None else "N/A",
-                "Starter SIP": f"₹{_sip:,.0f}",
-                "Reason": f"{_badge_txt} — {_e['reason']}",
-                "Months to Graduate": _months,
-            })
-        st.dataframe(pd.DataFrame(inc_rows), hide_index=True, width="stretch")
-        st.caption("All incubation SIPs are exact ₹5,000 multiples. Tier A = low vol + golden cross + ideal pullback; "
-                   "Tier B = standard cruising zone; Tier C = overheated (>+30% above 200-DMA) or trend not confirmed.")
-        st.caption(f"Incubation monthly total: ₹{incubation_total:,.0f} — deducted from the monthly budget below.")
-
     # ---- monthly execution table ----------------------------------------
     def _badge(r):
         if r.get("signal_type") == s4.HARD_STOP_LOSS:
@@ -2062,10 +2148,16 @@ def _render_stage4_planner(ctx: AppContext) -> None:
             return "0.0x Run-Up / Over-Allocated - Pause SIP (Hold Winners)"
         inc = r.get("incubation")
         sip = float(r.get("sip_multiplier") or 0.0)
+        if inc:
+            if sip >= 1.0:
+                return "1.0x Incubating"
+            if sip > 0.0:
+                return f"{sip:.1f}x Incubating"
+            return "0.0x Incubating (Paused / Excluded)"
         if sip >= 2.5:
             return "2.5x Resting Winner"
         if sip >= 1.0:
-            return "1.0x Incubating" if inc else "1.0x Cruising Stock"
+            return "1.0x Cruising Stock"
         return "0.0x Broken Trend - Hold & Verify GTT"
 
     def _dma_dist(r):
