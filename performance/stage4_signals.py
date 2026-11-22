@@ -24,7 +24,7 @@ import os
 import sqlite3
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from itertools import pairwise
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +471,73 @@ def evaluate_signal(stock: StockInput, metrics: dict, portfolioTotals: Portfolio
 
 
 # --------------------------------------------------------------------------- #
+# Nifty 500 trailing 52-week drawdown helpers
+# --------------------------------------------------------------------------- #
+def _nifty500_52w_drawdown(prices: PriceIndex, d: date) -> float | None:
+    """Trailing 52-week-high drawdown of the Nifty 500 (^CRSLDX / MONIFTY500.NS).
+
+    Drawdown is expressed as a NEGATIVE fraction of the trailing 52-week high
+    (``(end_px - high_px) / high_px``), i.e. -0.20 == 20% peak-to-trough crash.
+    Returns ``None`` when the benchmark price is not measurable at-or-before
+    ``d`` (unavailable -> no freeze).
+    """
+    end_px = _nifty500_price(prices, d)
+    if end_px is None or end_px <= 0:
+        return None
+    window_start = d - timedelta(days=365)  # ~52 weeks of trading history
+    high = None
+    for ticker in bd.NIFTY500_TICKERS:
+        px = prices.price_on(ticker, d)
+        if px is not None and px > 0:
+            return px
+    return None
+
+
+def get_nifty500_52w_drawdown(as_of=None, db_path=None, prices=None):
+    """Public API re-exported from performance.stage4_backtest for Stage 4C planner / UI."""
+    def _to_date(v):
+        return v if isinstance(v, date) else None
+
+    if prices is not None:
+        return _nifty500_52w_drawdown(prices=prices, d=as_of)
+
+    resolved_db = db_path or os.environ.get("MARKET_DB", "data/market_data.sqlite3")
+    if not os.path.exists(resolved_db):
+        return None
+    con = sqlite3.connect(resolved_db)
+    try:
+        rows = con.execute(
+            "SELECT trade_date, COALESCE(adjusted_close, close_price) FROM stock_prices "
+            "WHERE UPPER(security_id)=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+            ("^CRSLDX", str((as_of or date.today()).isoformat()[:10]),
+             str((as_of or date.today()) - timedelta(days=365)).isoformat())
+        ).fetchall()
+        con.close()
+    except Exception:
+        return None
+    if not rows:
+        # fallback to MONIFTY500.NS
+        try:
+            rows = con.execute(
+                "SELECT trade_date, COALESCE(adjusted_close, close_price) FROM stock_prices "
+                "WHERE UPPER(security_id)=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+                ("MONIFTY500.NS", str((as_of or date.today()).isoformat()[:10]),
+                 str((as_of or date.today()) - timedelta(days=365)).isoformat())
+            ).fetchall()
+            con.close()
+        except Exception:
+            return None
+    prices_list = [float(r[1]) for r in rows if r[1] is not None]
+    if not prices_list:
+        return None
+    end_px = prices_list[-1]
+    peak_px = max(prices_list)
+    if peak_px <= 0 or end_px <= 0:
+        return None
+    return (end_px - peak_px) / peak_px
+
+
+# --------------------------------------------------------------------------- #
 # Monthly SIP multiplier
 # --------------------------------------------------------------------------- #
 def compute_sip_multiplier(stock: StockInput, metrics: dict, benchmarkXIRR: float | None,
@@ -525,23 +592,30 @@ def compute_sip_multiplier(stock: StockInput, metrics: dict, benchmarkXIRR: floa
 
 
 
-def incubation_starter_sip(metrics: dict) -> dict:
+def incubation_starter_sip(metrics: dict, base_unit_sip: float = 10000.0, max_single_stock_sip: float = 35000.0) -> dict:
     # Starter monthly SIP for an incubating (< Rs 1,00,000) stock: Tier A/B/C.
     dma_short = metrics.get("dma_50")
     dma_long = metrics.get("dma_200")
     annual_vol = metrics.get("annual_volatility")
     dma200_dist = metrics.get("dma200_distance_pct")
     golden_cross = bool(dma_short is not None and dma_long is not None and dma_long > 0 and dma_short > dma_long)
+
+    def _round_to_5k(raw: float) -> float:
+        val = max(5000.0, math.floor((float(raw) / 5000.0) + 0.5) * 5000.0)
+        if max_single_stock_sip is not None:
+            val = min(val, float(max_single_stock_sip))
+        return float(val)
+
     if dma200_dist is None:
-        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Insufficient price history - toe-hold Rs 5k"}
+        return {"sip": _round_to_5k(0.5 * base_unit_sip), "tier": "C", "is_golden_cross": golden_cross, "reason": "Insufficient price history - toe-hold Rs 5k"}
     if dma200_dist < 0.0:
-        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Below 200-DMA - trend not confirmed Rs 5k"}
+        return {"sip": _round_to_5k(0.5 * base_unit_sip), "tier": "C", "is_golden_cross": golden_cross, "reason": "Below 200-DMA - trend not confirmed Rs 5k"}
     if dma200_dist > SIP_RUN_UP_DMA_DISTANCE:
-        return {"sip": INCUBATION_TIER_C_SIP, "tier": "C", "is_golden_cross": golden_cross, "reason": "Overheated >30% above 200-DMA - toe-hold Rs 5k"}
+        return {"sip": _round_to_5k(0.5 * base_unit_sip), "tier": "C", "is_golden_cross": golden_cross, "reason": "Overheated >30% above 200-DMA - toe-hold Rs 5k"}
     if (annual_vol is not None and annual_vol < SIP_TIER_A_MAX_VOL and golden_cross
             and dma200_dist <= SIP_PULLBACK_DMA_DISTANCE_MAX):
-        return {"sip": INCUBATION_TIER_A_SIP, "tier": "A", "is_golden_cross": golden_cross, "reason": "Ideal 200-DMA pullback + golden cross - fast-track Rs 20k"}
-    return {"sip": INCUBATION_TIER_B_SIP, "tier": "B", "is_golden_cross": golden_cross, "reason": "Standard incubation pace Rs 10k"}
+        return {"sip": _round_to_5k(2.0 * base_unit_sip), "tier": "A", "is_golden_cross": golden_cross, "reason": "Ideal 200-DMA pullback + golden cross - fast-track Rs 20k"}
+    return {"sip": _round_to_5k(1.0 * base_unit_sip), "tier": "B", "is_golden_cross": golden_cross, "reason": "Standard incubation pace Rs 10k"}
 
 
 def months_to_graduate(invested_cost, starter_sip) -> int | None:
@@ -622,6 +696,37 @@ def evaluate_signals(stocks, portfolioTotals: PortfolioTotals,
             and (not pause_hold)
             and ((sip == 0.0) or (buf is not None and buf <= GTT_BUFFER_WARN))
         )
+        sip_reason = None
+        if metrics.get("incubation") and not metrics.get("excluded"):
+            inc_dist = metrics.get("dma200_distance_pct")
+            if inc_dist is None:
+                sip_reason = "Incubating (< ₹1L) – Insufficient price history"
+            elif float(inc_dist) < 0.0:
+                sip_reason = "Incubating (< ₹1L) – Below 200-DMA"
+            elif float(inc_dist) > SIP_RUN_UP_DMA_DISTANCE:
+                sip_reason = "Run-Up Freeze (>30% above 200-DMA)"
+            else:
+                sip_reason = "Incubating (< ₹1L) – Healthy trend"
+        elif sip == 0.0:
+            if dma_dist is not None and float(dma_dist) < 0.0:
+                sip_reason = f"Broken Trend (price below 200-DMA: {float(dma_dist) * 100:.1f}%)"
+            elif aer_m is not None and float(aer_m) < SIP_BROKEN_TREND_AER:
+                sip_reason = f"Broken Trend (AER {float(aer_m):.2f}x < {SIP_BROKEN_TREND_AER:.2f}x)"
+            elif run_up:
+                sip_reason = "Run-Up Freeze (>30% above 200-DMA)"
+            elif over_allocated:
+                sip_reason = f"Over-Allocated Freeze (AER {float(aer_m):.2f}x >= {SIP_OVERALLOC_AER:.2f}x)"
+            else:
+                sip_reason = "SIP paused (0.0x) – Gate / freeze"
+        elif sip == 2.5:
+            if dma_dist is not None and float(dma_dist) >= 0.0 and float(dma_dist) <= SIP_PULLBACK_DMA_DISTANCE_MAX:
+                sip_reason = f"Resting Winner (pullback +{float(dma_dist) * 100:.1f}%, AER {float(aer_m):.2f}x)"
+        elif sip == 1.0:
+            if dma_dist is not None:
+                sip_reason = f"Cruising (+{float(dma_dist) * 100:.1f}% above 200-DMA)"
+        if sip_reason is None:
+            sip_reason = f"SIP bucket: {sip:.1f}x"
+        row["sip_reason"] = sip_reason
         rows.append(row)
 
     # Flag the Bottom-5 laggards by Efficiency Score (ascending).

@@ -1491,6 +1491,76 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
             return sid
 
     # ---- prioritized action cards ----------------------------------------
+    with st.container(border=True):
+        st.markdown("### 📊 Market-Condition Deployment Advisor\n")
+        nifty_52w_dd = s4.get_nifty500_52w_drawdown(as_of=as_of, db_path=ctx.market_db_path)
+        if nifty_52w_dd is None:
+            nifty_52w_dd_str = "Nifty 500 52w DD: Unavailable (defaulting to Normal 1.0x)"
+        else:
+            nifty_52w_dd_str = f"{nifty_52w_dd * 100:.2f}%"
+        if nifty_52w_dd is None or nifty_52w_dd > -0.10:
+            regime, mult = "Normal (1.0x)", 1.0
+        elif -0.20 <= nifty_52w_dd <= -0.10:
+            regime, mult = "Correction (2.0x)", 2.0
+        else:
+            regime, mult = "Crash Freeze (2.0x)", 2.0
+            st.error("⚠️ Crash Freeze engaged: defensive exits paused.")
+        st.markdown(f"**Regime:** {regime}")
+        base_tranche = st.number_input("Base Monthly Tranche (Rs)", min_value=50000, value=750000, step=25000)
+        monthly_ceiling = base_tranche * mult
+        expected_sell_proceeds = 0.0
+        net_redemption = 0.0
+        for r in rows:
+            sig = r.get("signal_type")
+            if sig == s4.HARD_STOP_LOSS:
+                shares = int(r.get("quantity") or 0)
+                cmp_ = float(r.get("cmp") or 0.0)
+                taxp = s4.fifo_tax_preview(txs, r["security_id"], shares, cmp_, as_of,
+                                           opening_positions=ctx.opening_positions)
+                expected_sell_proceeds += float(taxp["net_cash_unlocked"])
+            elif sig == s4.CONCENTRATION_TRIM:
+                sh = int(r.get("shares_to_sell") or 0)
+                cmp_ = float(r.get("cmp") or 0.0)
+                taxp = s4.fifo_tax_preview(txs, r["security_id"], sh, cmp_, as_of,
+                                           opening_positions=ctx.opening_positions)
+                expected_sell_proceeds += float(taxp["net_cash_unlocked"])
+        alloc = s4.compute_bottom_up_sip_allocation(
+            rows, None,
+            base_unit_sip=float(st.session_state.get("s4c_base_unit_sip", s4.BASE_UNIT_SIP)),
+            max_budget_ceiling=float(st.session_state.get("s4c_budget", s4.DEFAULT_MONTHLY_SIP_BUDGET)),
+            max_single_stock_sip=float(st.session_state.get("s4c_max_sip", s4.MAX_SINGLE_STOCK_SIP)),
+        )
+        engine_buy_demand = float(alloc.get("total_allocated") or 0.0)
+        paused_count = sum(1 for r in rows if not r.get("incubation") and float(r.get("sip_multiplier") or 0.0) == 0.0)
+        net_redemption = max(0.0, min(monthly_ceiling, engine_buy_demand) - expected_sell_proceeds)
+
+        c1 = st.columns(4)
+        with c1[0]:
+            st.metric("Regime Multiplier", f"{mult:.1f}x")
+        with c1[1]:
+            st.metric("Monthly Ceiling", inr(monthly_ceiling))
+        with c1[2]:
+            st.metric("Engine Buy Demand", inr(engine_buy_demand))
+        with c1[3]:
+            st.metric("Paused (0.0x) Stocks", str(paused_count))
+
+        c2 = st.columns(4)
+        with c2[0]:
+            st.metric("Expected Sell Proceeds", inr(expected_sell_proceeds))
+        with c2[1]:
+            st.metric("Net Arbitrage Redemption", inr(net_redemption))
+        with c2[2]:
+            st.metric("Nifty 500 52w DD", nifty_52w_dd_str)
+        with c2[3]:
+            st.metric("Base Tranche", inr(base_tranche))
+
+        if expected_sell_proceeds > 0:
+            if nifty_52w_dd is None or nifty_52w_dd > -0.10:
+                st.info(f"🟢 **Normal / Rising:** Split expected proceeds into **3 monthly tranches** (`{inr(expected_sell_proceeds / 3.0)}` / month) and park the rest in Arbitrage/Liquid.")
+            elif -0.20 <= nifty_52w_dd <= -0.10:
+                st.info(f"🟡 **Correction:** Accelerate proceeds into **2 monthly tranches** (`{inr(expected_sell_proceeds / 2.0)}` / month).")
+            else:
+                st.info("🔴 **Crash Freeze:** Deploy in **1–2 aggressive tranches** into above-200-DMA winners while exits remain paused.")
     st.markdown("**Prioritized Sell & Trim Actions**")
     action_rows = [r for r in rows if r["signal_type"] in (
         s4.HARD_STOP_LOSS, s4.CONCENTRATION_TRIM)]
@@ -1640,7 +1710,11 @@ def _rehydrate_incubation_entries(ctx: AppContext, as_of) -> dict:
                                holding_start_date=as_of, price_series=series, price_dates=dates)
             m = s4.analyzeStockSignals(
                 si, s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0), 0.12)
-            starter = s4.incubation_starter_sip(m)
+            starter = s4.incubation_starter_sip(
+                m,
+                base_unit_sip=float(st.session_state.get("s4c_base_unit_sip", s4.BASE_UNIT_SIP)),
+                max_single_stock_sip=float(st.session_state.get("s4c_max_sip", s4.MAX_SINGLE_STOCK_SIP)),
+            )
             base.update({
                 "cmp": m.get("cmp") or series[-1],
                 "annual_volatility": m.get("annual_volatility"),
@@ -1879,7 +1953,11 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                                     price_dates=_dates)
                 _tot = s4.PortfolioTotals(total_invested_cost=0.0, total_market_value=0.0)
                 _m = s4.analyzeStockSignals(_si, _tot, 0.12)
-                _starter = s4.incubation_starter_sip(_m)
+                _starter = s4.incubation_starter_sip(
+                    _m,
+                    base_unit_sip=base_unit_sip,
+                    max_single_stock_sip=max_single_stock_sip,
+                )
                 _cmp = _m.get("cmp") or _series[-1]
                 _company = resolve_company_name(_ticker, nse_ticker=_ticker, db_path=ctx.market_db_path)
                 if _isin and _ticker:
@@ -2046,6 +2124,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
             "200-DMA": _dma_dist(r),
             "AER": f"{r['aer']:.2f}x" if r.get("aer") is not None else "N/A",
             "Signal": _badge(r),
+            "Why / Reason": str(r.get("sip_reason") or ""),
             "SIP (Rs)": f"{sip_amt:,.0f}",
             "Shares": str(r.get("est_shares") or 0),
             "GTT (Rs)": gtt_disp,
