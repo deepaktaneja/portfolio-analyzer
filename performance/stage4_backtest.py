@@ -72,7 +72,7 @@ MIN_HISTORY_DAYS = DMA_LONG    # 200 trading days of history before activation
 INDEX_DIVIDEND_YIELD = 0.013   # +1.30% p.a. TRI dividend yield for ^NSEI / ^CRSLDX
 WATCHLIST_MAX_YEARS = 3        # watchlist stocks may only activate in the last 3 years
 
-VALID_YEARS = (3, 5, 7)
+VALID_YEARS = (3, 4, 5, 6, 7)
 
 # Diagnostic-only sell-reason ordering for the Stage 4E audit table.
 # HARD_STOP_LOSS / LAGGARD_EXIT / CONCENTRATION_TRIM are the strategy rules;
@@ -1251,7 +1251,7 @@ def run_backtest(config: BacktestConfig | None = None, market_db_path=None,
     for st in states:
         not_before = st.first_buy_date or backtest_start
         # Prospective watchlist additions may only activate in the most recent
-        # 3 years (end_date - 3y) regardless of the 3/5/7-year window — never
+        # 3 years (end_date - 3y) regardless of the selected backtest window — never
         # back-date them into 2019-2022. Still subject to the 200-DMA warm-up.
         if "watchlist" in (st.sources or set()):
             not_before = max(not_before, _years_before(data_end, WATCHLIST_MAX_YEARS))

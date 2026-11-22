@@ -3,7 +3,7 @@
 A crisp monthly Direct Equity Decision Engine with three focused tabs:
   1. Monthly Action & SIP Engine - Stage 4 sell/trim action cards + SIP planner.
   2. Sector & Concentration - portfolio guardrail view.
-  3. Strategy Backtester (3Y / 5Y / 7Y) - Stage 4E walk-forward backtester.
+  3. Strategy Backtester (3Y / 4Y / 5Y / 6Y / 7Y) - Stage 4E walk-forward backtester.
 
 Descriptive KPIs, risk-adjusted metrics and holding-level attribution live on
 Page 1 (Portfolio); this page focuses on the once-a-month execution checklist.
@@ -2304,7 +2304,7 @@ def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, 
 
 
 def _render_stage4_backtester(ctx: AppContext) -> None:
-    """Stage 4E - Strategy Backtester UI (3Y / 5Y / 7Y).
+    """Stage 4E - Strategy Backtester UI (3Y / 4Y / 5Y / 6Y / 7Y).
 
     Calls run_backtest() from performance.stage4_backtest directly (via a
     cache_data wrapper) so toggling filters / timeframe feels instantaneous.
@@ -2317,17 +2317,17 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
 
     from performance import backtest_data as bd
 
-    st.markdown("#### Strategy Backtester (3Y / 5Y / 7Y)")
+    st.markdown("#### Strategy Backtester (3Y / 4Y / 5Y / 6Y / 7Y)")
     st.caption(
         "Walk-forward simulation over the local 8-year price cache. "
         "Zero look-ahead bias; advisory only - nothing is executed."
     )
 
-    c1, c2, c3, c4, c5 = st.columns([1.4, 1.7, 1.7, 1.8, 1.0])
+    c1, c2, c3, c4 = st.columns([1.4, 1.7, 1.7, 1.0])
     with c1:
         years = st.radio(
-            "Timeframe", [3, 5, 7], index=2, horizontal=True, key="s4e_years",
-            help="Backtest window (3 / 5 / 7 years).",
+            "Timeframe", [3, 4, 5, 6, 7], index=4, horizontal=True, key="s4e_years",
+            help="Backtest window (3 / 4 / 5 / 6 / 7 years).",
         )
     with c2:
         compare_wl = st.checkbox(
@@ -2340,11 +2340,6 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             help="Include closed historical positions (net_qty == 0) such as YESBANK.NS.",
         )
     with c4:
-        compare_trim = st.checkbox(
-            "Compare 2.20x vs. 2.25x AER Trim", value=True, key="s4e_compare_trim",
-            help="Run the 2.20x (1.40x reset) and 2.25x (1.60x reset) concentration-trim rules side-by-side.",
-        )
-    with c5:
         run_btn = st.button(
             "Run Backtest", key="s4e_run", type="primary", use_container_width=True,
         )
@@ -2375,16 +2370,6 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         except Exception as e:  # noqa: BLE001
             st.error(f"Backtest unavailable: {e}")
             return
-
-    res_225 = None
-    if compare_trim:
-        with st.spinner("Simulating 2.25x AER trim configuration..."):
-            try:
-                res_225 = _run_stage4_backtest_cached(
-                    int(years), False, include_closed, market_db, txs_json, holdings_json,
-                    trim_aer=2.25, trim_target_mult=1.60)
-            except Exception as e:  # noqa: BLE001
-                st.error(f"2.25x trim comparison unavailable: {e}")
 
     res_wl = None
     if compare_wl:
@@ -2433,21 +2418,10 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     fig.add_trace(
         go.Scatter(
             x=port_dates, y=port_values,
-            name=("Stage 4 (2.20x Trim)" if res_225 else "Stage 4 Engine (Post-Tax)"),
+            name="Stage 4 (2.20x Trim)",
             line={"width": 2, "color": "#1f77b4"},
         )
     )
-
-    if res_225:
-        d225 = res_225.get("daily_curve", [])
-        fig.add_trace(
-            go.Scatter(
-                x=[_d.fromisoformat(r["date"]) for r in d225],
-                y=[r["value"] for r in d225],
-                name="Stage 4 (2.25x Trim)",
-                line={"width": 2, "color": "#e377c2", "dash": "dash"},
-            )
-        )
 
     if res_wl:
         wl_daily = res_wl.get("daily_curve", [])
@@ -2555,9 +2529,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             "Sell / Trim Trades": sc.get("trade_count", b.get("trade_count", 0)),
         }
 
-    sc_rows.append(_sc_row("Stage 4 (2.20x Trim)" if res_225 else "Stage 4 Engine (Current Portfolio)", res_main))
-    if res_225:
-        sc_rows.append(_sc_row("Stage 4 (2.25x Trim)", res_225))
+    sc_rows.append(_sc_row("Stage 4 (2.20x Trim)", res_main))
     if res_wl:
         sc_rows.append(_sc_row("Stage 4 Engine (+Watchlist)", res_wl))
     # Reference row: the user's real-life Direct Equity ledger over the same window.
@@ -2581,99 +2553,101 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         "cashflows over the same dates, so their performance is directly comparable."
     )
 
-    # ---- Year-by-Year Capital & Value Audit Table ---------------------------
-    st.markdown("#### Year-by-Year Capital & Value Audit")
+    with st.expander("Year-by-Year Capital & Value Audit", expanded=False):
+        # ---- Year-by-Year Capital & Value Audit Table ---------------------------
+        st.markdown("#### Year-by-Year Capital & Value Audit")
 
-    def _curve_entries(curve):
-        ents = []
-        for r in curve or []:
-            try:
-                ents.append((_d.fromisoformat(str(r["date"])[:10]), r))
-            except Exception:  # noqa: BLE001, S112
+        def _curve_entries(curve):
+            ents = []
+            for r in curve or []:
+                try:
+                    ents.append((_d.fromisoformat(str(r["date"])[:10]), r))
+                except Exception:  # noqa: BLE001, S112
+                    continue
+            ents.sort(key=lambda x: x[0])
+            return ents
+
+        def _value_at(ents, target, field="value"):
+            val = None
+            for dt, r in ents:
+                if dt <= target:
+                    val = r.get(field)
+                else:
+                    break
+            return val
+
+        _cf_pairs = sorted((_d.fromisoformat(d), amt) for d, amt in res_main.get("cashflows", []))
+
+        def _cum_capital(target):
+            return sum(abs(a) for dt, a in _cf_pairs if dt <= target)
+
+        main_ents = _curve_entries(res_main.get("daily_curve", []))
+        ew_ents = _curve_entries(res_main.get("benchmarks", {}).get("equal_weight", {}).get("daily_curve", []))
+        n50_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty50", {}).get("daily_curve", []))
+        n500_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty500", {}).get("daily_curve", []))
+        audit_rows = []
+        for yr in sorted({dt.year for dt, _ in main_ents}):
+            year_end = _d(yr, 12, 31)
+            total = _value_at(main_ents, year_end, "value")
+            if total is None:
                 continue
-        ents.sort(key=lambda x: x[0])
-        return ents
+            cash_res = _value_at(main_ents, year_end, "cash") or 0.0
+            # Year-end snapshot at the last traded day of the year (aligned with the
+            # Dec-31 ordering of the value columns above).
+            year_entries = [(dt, r) for dt, r in main_ents if dt.year == yr]
+            year_end_entry = year_entries[-1][1]
+            audit_rows.append({
+                "Year-End": str(yr),
+                "Cumulative Net Capital Invested (INR)": _fmt_inr(_cum_capital(year_end)),
+                "Stage 4 Active Equity Value (INR)": _fmt_inr((total or 0.0) - cash_res),
+                "Stage 4 Uninvested Cash (INR)": _fmt_inr(cash_res),
+                "Stage 4 Total Net Value (INR)": _fmt_inr(total or 0.0),
+                "Equal-Weight Buy & Hold Value (INR)": _fmt_inr(_value_at(ew_ents, year_end) or 0.0),
+                "Nifty 50 TRI Value (INR)": _fmt_inr(_value_at(n50_ents, year_end) or 0.0),
+                "Nifty 500 TRI Value (INR)": _fmt_inr(_value_at(n500_ents, year_end) or 0.0),
+                "Active Holdings Count": int(year_end_entry.get("holdings_count", 0)),
+                "Eligible Buy Stocks Count": int(year_end_entry.get("eligible_sip_count", 0)),
+            })
+        if audit_rows:
+            ui.safe_dataframe(pd.DataFrame(audit_rows), key="s4e_capital_audit")
+            st.caption(
+                "Capital audit: cumulative net out-of-pocket rupees deployed vs. the ending "
+                "equity, liquid-cash reserve and total net value each calendar year-end, "
+                "alongside the Equal-Weight and Nifty TRI benchmark values (same cashflows)."
+            )
 
-    def _value_at(ents, target, field="value"):
-        val = None
-        for dt, r in ents:
-            if dt <= target:
-                val = r.get(field)
-            else:
-                break
-        return val
-
-    _cf_pairs = sorted((_d.fromisoformat(d), amt) for d, amt in res_main.get("cashflows", []))
-
-    def _cum_capital(target):
-        return sum(abs(a) for dt, a in _cf_pairs if dt <= target)
-
-    main_ents = _curve_entries(res_main.get("daily_curve", []))
-    ew_ents = _curve_entries(res_main.get("benchmarks", {}).get("equal_weight", {}).get("daily_curve", []))
-    n50_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty50", {}).get("daily_curve", []))
-    n500_ents = _curve_entries(res_main.get("benchmarks", {}).get("nifty500", {}).get("daily_curve", []))
-    audit_rows = []
-    for yr in sorted({dt.year for dt, _ in main_ents}):
-        year_end = _d(yr, 12, 31)
-        total = _value_at(main_ents, year_end, "value")
-        if total is None:
-            continue
-        cash_res = _value_at(main_ents, year_end, "cash") or 0.0
-        # Year-end snapshot at the last traded day of the year (aligned with the
-        # Dec-31 ordering of the value columns above).
-        year_entries = [(dt, r) for dt, r in main_ents if dt.year == yr]
-        year_end_entry = year_entries[-1][1]
-        audit_rows.append({
-            "Year-End": str(yr),
-            "Cumulative Net Capital Invested (INR)": _fmt_inr(_cum_capital(year_end)),
-            "Stage 4 Active Equity Value (INR)": _fmt_inr((total or 0.0) - cash_res),
-            "Stage 4 Uninvested Cash (INR)": _fmt_inr(cash_res),
-            "Stage 4 Total Net Value (INR)": _fmt_inr(total or 0.0),
-            "Equal-Weight Buy & Hold Value (INR)": _fmt_inr(_value_at(ew_ents, year_end) or 0.0),
-            "Nifty 50 TRI Value (INR)": _fmt_inr(_value_at(n50_ents, year_end) or 0.0),
-            "Nifty 500 TRI Value (INR)": _fmt_inr(_value_at(n500_ents, year_end) or 0.0),
-            "Active Holdings Count": int(year_end_entry.get("holdings_count", 0)),
-            "Eligible Buy Stocks Count": int(year_end_entry.get("eligible_sip_count", 0)),
-        })
-    if audit_rows:
-        ui.safe_dataframe(pd.DataFrame(audit_rows), key="s4e_capital_audit")
+    with st.expander("Sell Proceeds Breakdown by Trigger Reason", expanded=False):
+        # ---- Sell Proceeds Breakdown by Trigger Reason (diagnostic) ----------------
+        st.markdown("#### Sell Proceeds Breakdown by Trigger Reason")
         st.caption(
-            "Capital audit: cumulative net out-of-pocket rupees deployed vs. the ending "
-            "equity, liquid-cash reserve and total net value each calendar year-end, "
-            "alongside the Equal-Weight and Nifty TRI benchmark values (same cashflows)."
+            "Exact Trade Count and Gross Proceeds (₹) for each sell trigger, summed across "
+            "the full backtest window. Proceeds are recorded GROSS (before friction & tax) "
+            "so the TOTAL reconciles exactly with the scorecard `realized_sells` figure. "
+            "HARD_STOP_LOSS / LAGGARD_EXIT / CONCENTRATION_TRIM are the strategy rules; "
+            "GTT_STOP_LOSS is the price-based dynamic stop, now evaluated monthly-only on "
+            "the review day (Stage 4 Exp #6). CATASTROPHE_GTT is "
+            "listed for audit completeness and stays at 0 while the blind 45% floor is "
+            "disabled."
         )
-
-    # ---- Sell Proceeds Breakdown by Trigger Reason (diagnostic) ----------------
-    st.markdown("#### Sell Proceeds Breakdown by Trigger Reason")
-    st.caption(
-        "Exact Trade Count and Gross Proceeds (₹) for each sell trigger, summed across "
-        "the full backtest window. Proceeds are recorded GROSS (before friction & tax) "
-        "so the TOTAL reconciles exactly with the scorecard `realized_sells` figure. "
-        "HARD_STOP_LOSS / LAGGARD_EXIT / CONCENTRATION_TRIM are the strategy rules; "
-        "GTT_STOP_LOSS is the price-based dynamic stop, now evaluated monthly-only on "
-        "the review day (Stage 4 Exp #6). CATASTROPHE_GTT is "
-        "listed for audit completeness and stays at 0 while the blind 45% floor is "
-        "disabled."
-    )
-    sell_breakdown = res_main.get("sell_breakdown") or {}
-    _sell_rows = []
-    for _r in sell_breakdown.get("rows", []):
-        _sell_rows.append({
-            "Sell Trigger": _r.get("reason"),
-            "Trade Count": _r.get("count", 0),
-            "Gross Proceeds (₹)": _fmt_inr(_r.get("gross")),
-        })
-    if _sell_rows:
-        _sell_rows.append({
-            "Sell Trigger": "TOTAL (all triggers)",
-            "Trade Count": sell_breakdown.get("total_trades", 0),
-            "Gross Proceeds (₹)": _fmt_inr(sell_breakdown.get("total_gross_proceeds")),
-        })
-        ui.safe_dataframe(pd.DataFrame(_sell_rows), key="s4e_sell_breakdown")
-        st.caption(
-            "TOTAL gross proceeds reconcile exactly with the scorecard "
-            "`realized_sells`; rows with 0 trades simply never fired in this run."
-        )
+        sell_breakdown = res_main.get("sell_breakdown") or {}
+        _sell_rows = []
+        for _r in sell_breakdown.get("rows", []):
+            _sell_rows.append({
+                "Sell Trigger": _r.get("reason"),
+                "Trade Count": _r.get("count", 0),
+                "Gross Proceeds (₹)": _fmt_inr(_r.get("gross")),
+            })
+        if _sell_rows:
+            _sell_rows.append({
+                "Sell Trigger": "TOTAL (all triggers)",
+                "Trade Count": sell_breakdown.get("total_trades", 0),
+                "Gross Proceeds (₹)": _fmt_inr(sell_breakdown.get("total_gross_proceeds")),
+            })
+            ui.safe_dataframe(pd.DataFrame(_sell_rows), key="s4e_sell_breakdown")
+            st.caption(
+                "TOTAL gross proceeds reconcile exactly with the scorecard "
+                "`realized_sells`; rows with 0 trades simply never fired in this run."
+            )
 
     st.markdown("#### Calendar-Year Returns")
     cy = res_main.get("calendar_year_returns", {})
@@ -2691,8 +2665,6 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
 
     cy_index = _year_index(cy)
     cy_wl_index = _year_index(cy_wl)
-    cy_225 = res_225.get("calendar_year_returns", {}) if res_225 else {}
-    cy_225_index = _year_index(cy_225)
     bench_cy = {
         label: res_main.get("benchmarks", {}).get(key, {}).get("calendar_year_returns", {})
         for label, key, _c, _t in bench_specs
@@ -2705,10 +2677,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         cy_rows = []
         for y in all_years:
             label = cy_index.get(y, str(y))
-            row = {"Year": label, ("Stage 4 (2.20x Trim) (%)" if res_225 else "Stage 4 Engine (%)"): cy.get(label)}
-            if res_225:
-                label_225 = cy_225_index.get(y, label)
-                row["Stage 4 (2.25x Trim) (%)"] = cy_225.get(label_225)
+            row = {"Year": label, "Stage 4 (2.20x Trim) (%)": cy.get(label)}
             if res_wl:
                 wl_label = cy_wl_index.get(y, label)
                 row["Stage 4 Engine (+Watchlist) (%)"] = cy_wl.get(wl_label)
@@ -2720,29 +2689,30 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     else:
         st.info("Calendar-year returns require cached price coverage across the window.")
 
-    st.markdown("#### Per-Stock Attribution & Closed-Blowup Table")
-    att = res_main.get("attribution", [])
-    if att:
-        att_rows = []
-        for r in att:
-            invested = r.get("invested") or 0.0
-            cur_val = r.get("current_value") or 0.0
-            proceeds = r.get("realized_proceeds") or 0.0
-            total_val = cur_val + proceeds
-            gain = total_val - invested
-            att_rows.append({
-                "Ticker": r.get("ticker"),
-                "Status": r.get("status"),
-                "Total Invested (INR)": round(invested, 2),
-                "Harvested + Ending Value (INR)": round(total_val, 2),
-                "Net Gain/Loss (INR)": round(gain, 2),
-                "Gain (%)": round((gain / invested * 100.0) if invested > 0 else 0.0, 2),
-                "Sell / Trim Trades": r.get("trades", 0),
-            })
-        ui.safe_dataframe(pd.DataFrame(att_rows), key="s4e_attribution")
-        st.caption("Closed positions (e.g., YESBANK.NS) appear with status resolved when fully exited.")
-    else:
-        st.info("No attribution data available.")
+    with st.expander("Per-Stock Attribution & Closed-Blowup Table", expanded=False):
+        st.markdown("#### Per-Stock Attribution & Closed-Blowup Table")
+        att = res_main.get("attribution", [])
+        if att:
+            att_rows = []
+            for r in att:
+                invested = r.get("invested") or 0.0
+                cur_val = r.get("current_value") or 0.0
+                proceeds = r.get("realized_proceeds") or 0.0
+                total_val = cur_val + proceeds
+                gain = total_val - invested
+                att_rows.append({
+                    "Ticker": r.get("ticker"),
+                    "Status": r.get("status"),
+                    "Total Invested (INR)": round(invested, 2),
+                    "Harvested + Ending Value (INR)": round(total_val, 2),
+                    "Net Gain/Loss (INR)": round(gain, 2),
+                    "Gain (%)": round((gain / invested * 100.0) if invested > 0 else 0.0, 2),
+                    "Sell / Trim Trades": r.get("trades", 0),
+                })
+            ui.safe_dataframe(pd.DataFrame(att_rows), key="s4e_attribution")
+            st.caption("Closed positions (e.g., YESBANK.NS) appear with status resolved when fully exited.")
+        else:
+            st.info("No attribution data available.")
 
 
 def render(ctx: AppContext) -> None:
@@ -2759,7 +2729,7 @@ def render(ctx: AppContext) -> None:
     tab_action, tab_sector, tab_backtest = st.tabs([
         "Monthly Action & SIP Engine",
         "Sector & Concentration",
-        "Strategy Backtester (3Y / 5Y / 7Y)",
+        "Strategy Backtester (3Y / 4Y / 5Y / 6Y / 7Y)",
     ])
     with tab_action:
         _render_stage4_action_center(ctx)
