@@ -994,6 +994,7 @@ def _lifecycle_stats(stats: dict) -> dict:
     lg.setdefault("quarantined_count", 0)
     lg.setdefault("reentered_count", 0)
     lg.setdefault("dropped_two_strikes", 0)
+    lg.setdefault("dropped_tickers", [])
     return lg
 
 
@@ -1030,6 +1031,10 @@ def _apply_stop_loss_strike(st: _StockState, reason: str, d: date, enable_lifecy
         st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
         st.sip_multiplier = 0.0
         lg["dropped_two_strikes"] = int(lg.get("dropped_two_strikes") or 0) + 1
+        _dropped = lg.get("dropped_tickers") or []
+        if st.ticker not in _dropped:
+            _dropped.append(st.ticker)
+        lg["dropped_tickers"] = sorted(_dropped)
         return
     st.quarantine = True
     st.frozen = True
@@ -1465,7 +1470,8 @@ def _empty_result(config: BacktestConfig, sim_tickers) -> dict:
         "aer_stats": {"count": 0, "min": None, "median": None, "max": None},
         "cash_idle": {"total": 0, "no_eligible": 0,
                       "budget_limited": 0, "per_stock_caps": 0},
-        "lifecycle": {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0},
+        "lifecycle": {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0,
+                      "dropped_tickers": []},
     }
 
 
@@ -1681,7 +1687,8 @@ def run_backtest(config: BacktestConfig | None = None, market_db_path=None,
         "crash_freeze": stats.get("crash_freeze") or {"months": [], "nifty_dd": None, "triggered": 0,
                                                       "suppressed_gtt": 0, "suppressed_laggard": 0,
                                                       "drawdowns": []},
-        "lifecycle": stats.get("lifecycle") or {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0},
+        "lifecycle": stats.get("lifecycle") or {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0,
+                                            "dropped_tickers": []},
         "calendar_year_returns": _calendar_year_returns(monthly_out, contributions,
                                                         year_trading_days),
         "attribution": _build_attribution(states, prices, data_end),

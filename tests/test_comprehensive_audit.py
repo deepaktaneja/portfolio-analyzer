@@ -1604,4 +1604,5 @@ def test_end_to_end_two_strike_drop_after_golden_cross_reentry(monkeypatch):
     assert st.quarantine is False
     assert st.sip_multiplier == 0.0
     assert stats["lifecycle"]["dropped_two_strikes"] == 1
+    assert "Q.NS" in (stats.get("lifecycle") or {}).get("dropped_tickers") or []
 

@@ -2876,11 +2876,13 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         _q_strike1 = _lg.get("quarantined_count") or 0
         _re_entered = _lg.get("reentered_count") or 0
         _dropped_two = _lg.get("dropped_two_strikes") or 0
+        _dropped_list = (res_main.get("lifecycle") or {}).get("dropped_tickers") or []
+        _dropped_lbl = " (" + ", ".join(str(_t) for _t in _dropped_list) + ")" if _dropped_list else ""
         st.markdown(
             "**Lifecycle (Exit -> Quarantine -> Golden-Cross Re-Entry -> 2-Strikes):** "
             f"Quarantined (Strike 1): **{_q_strike1}** | "
             f"Re-Entered (Golden Cross): **{_re_entered}** | "
-            f"Dropped (2 Strikes): **{_dropped_two}**"
+            f"Dropped (2 Strikes): **{_dropped_two}**{_dropped_lbl}"
         )
 
     st.markdown("#### Comparison Scorecard")
