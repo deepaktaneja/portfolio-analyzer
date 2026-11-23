@@ -1001,12 +1001,35 @@ def _render_people(ctx: AppContext) -> None:
         s = st.session_state.get("_import_summary")
         if not s:
             return
-        msg = ("✅ Uploaded " + str(s["imported"]) + " new transactions | "
-               "⚠️ Skipped " + str(s.get("skipped", 0)) + " duplicate transactions.")
-        if s.get("skipped"):
-            st.warning(msg)
+        # --- Clear post-upload receipt ---
+        person = str(s.get("person", ""))
+        files = s.get("files") or []
+        total_parsed = sum(int(f.get("Parsed") or 0) for f in files)
+        total_imported = int(s.get("imported", 0))
+        total_skipped = int(s.get("skipped", 0))
+        date_froms = [str(f.get("DateFrom") or "") for f in files if f.get("DateFrom")]
+        date_tos = [str(f.get("DateTo") or "") for f in files if f.get("DateTo")]
+        date_range = ""
+        if date_froms and date_tos:
+            date_range = min(date_froms) + " → " + max(date_tos)
+        file_list = ", ".join(str(f.get("File", "")) for f in files) or "(no files)"
+        all_ok = all(str(f.get("Status", "")).startswith("✅") for f in files) and files
+        receipt = (
+            "📥 **Import receipt** — Portfolio: **" + person + "** | "
+            "File: " + file_list + " | "
+            "Parsed: " + str(total_parsed) + " | "
+            "New trades added: " + str(total_imported) + " | "
+            "Duplicates skipped: " + str(total_skipped)
+        )
+        if date_range:
+            receipt += " | Trade dates: " + date_range
+        if all_ok:
+            st.success(receipt, icon="✅")
+        elif total_imported > 0:
+            st.info(receipt, icon="ℹ️")
         else:
-            st.success(msg)
+            st.warning(receipt, icon="⚠️")
+        # --- Existing detail sections ---
         duplicates = s.get("duplicates") or []
         if duplicates:
             st.warning("Duplicate transactions skipped:")
@@ -1029,7 +1052,7 @@ def _render_people(ctx: AppContext) -> None:
             )
         if s.get("filter_note"):
             st.caption(s["filter_note"])
-        st.dataframe(pd.DataFrame(s["files"]), hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame(files), hide_index=True, width="stretch")
         st.caption("Portfolio XIRR is recomputed from these transactions on the Performance and Portfolio pages.")
         if st.button("Dismiss upload summary", key="dismiss_import_summary"):
             st.session_state.pop("_import_summary", None)
@@ -1104,7 +1127,12 @@ def _render_people(ctx: AppContext) -> None:
                 k = _row_key(r)
                 if k:
                     companies.add(k)
+            # Trade date range for this file's newly imported rows.
+            tx_dates = [str(r.get("trade_date") or r.get("settlement_date") or "") for r in new_rows if r.get("trade_date") or r.get("settlement_date")]
+            tx_dates = [d[:10] for d in tx_dates if d]
             p["rep"]["Imported"] = len(new_rows)
+            p["rep"]["DateFrom"] = min(tx_dates) if tx_dates else ""
+            p["rep"]["DateTo"] = max(tx_dates) if tx_dates else ""
             p["rep"]["Status"] = "✅ Imported" if new_rows else "⏭️ No rows kept"
 
         _clear_data_caches()
@@ -1150,6 +1178,7 @@ def _render_people(ctx: AppContext) -> None:
 
     with st.expander("Import transactions (XLS/TSV export) for this person", expanded=False):
         st.caption("ICICI portfolio transaction export: ISIN Code, Action, Quantity, Transaction Price, Transaction Date.")
+        st.info("🎯 Uploading transactions for: **" + person_label + "**", icon="👤")
         only_closed_x = st.checkbox("Only fully sold companies (net position = 0)", key="people_xls_only_closed")
         xups = st.file_uploader("Transaction file(s)", type=["xls", "xlsx", "csv", "tsv"], accept_multiple_files=True, key="people_xls_up")
         if xups:
@@ -1159,6 +1188,37 @@ def _render_people(ctx: AppContext) -> None:
             folder = Path("data/statements") / slug
             folder.mkdir(parents=True, exist_ok=True)
             _import_statement_files(xups, folder, parse_transactions_xls, only_closed_x, slug + "__", source_kind="XLS")
+
+    # --- Imported Files Audit Table (below XLS uploader) ---
+    st.markdown("#### Recently Imported Transaction Files")
+    view_all = st.checkbox("View all portfolios", key="xls_audit_view_all", value=False)
+    audit_pid = None if view_all else pid
+    try:
+        tx_rows = store.all_transactions(person_id=audit_pid)
+    except Exception:  # noqa: BLE001
+        tx_rows = []
+    if tx_rows:
+        from collections import defaultdict
+        by_file: dict[str, list[dict]] = defaultdict(list)
+        for r in tx_rows:
+            by_file[str(r.get("source_file") or "")].append(r)
+        prefix = slug + "__"
+        person_map = {int(p["id"]): str(p["name"]) for p in store.list_people()}
+        audit_rows = []
+        for src_file, rows in sorted(by_file.items(), key=lambda kv: kv[0]):
+            display_name = src_file.removeprefix(prefix)
+            dates = [str(r.get("trade_date") or r.get("settlement_date") or "")[:10] for r in rows if r.get("trade_date") or r.get("settlement_date")]
+            date_range = (min(dates) + " → " + max(dates)) if dates else ""
+            pname = person_label if not view_all else person_map.get(int(rows[0].get("person_id") or -1), "Unknown")
+            audit_rows.append({
+                "Portfolio": pname,
+                "File Name": display_name,
+                "Trades": len(rows),
+                "Date Range": date_range,
+            })
+        st.dataframe(pd.DataFrame(audit_rows), hide_index=True, width="stretch")
+    else:
+        st.caption("No imported transaction files yet.")
 
     with st.expander("Set 1 Jan 2014 as buy date for unmatched sells", expanded=False):
         st.caption("For every security with sells but missing buys, inserts a synthetic BUY dated 2014-01-01 priced at the 2014-01-01 Yahoo close. Securities without a 2014 price can be dropped.")
