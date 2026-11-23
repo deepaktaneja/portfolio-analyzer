@@ -2077,6 +2077,83 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 "(2) Pause fresh SIPs (0.0x).  (3) Verify your active broker GTT order & check for "
                 "governance / sector red flags.")
 
+    # ---- Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes Watchlist (Stage 4C) ----
+    with st.expander("Quarantine & Re-Entry Watchlist (Exit -> Quarantine -> Golden Cross -> Two Strikes)"):
+        try:
+            _wl_tickers: list[str] = []
+            _wl_seen: set[str] = set()
+
+            def _wl_add(t: str) -> None:
+                t = str(t or "").strip().upper()
+                if t and t not in _wl_seen:
+                    _wl_seen.add(t)
+                    _wl_tickers.append(t)
+
+            for _r in rows:
+                _wl_add(str(_r.get("security_id") or _r.get("ticker") or ""))
+            _wl_entries: dict = dict(st.session_state.get("s4c_incubation_entries") or {})
+            for _e in _wl_entries.values():
+                _wl_add(str(_e.get("ticker") or _e.get("nse_ticker") or ""))
+
+            def _wl_base(k) -> str:
+                _k = str(k or "").strip().upper()
+                return _k.removesuffix(".NS")
+
+            def _wl_strike_count(tk: str) -> int:
+                _base = _wl_base(tk)
+                _hits = 0
+                for _t in (txs or []):
+                    _side = str(_t.get("buy_sell") or _t.get("side") or "").strip().upper()
+                    if _side != "SELL":
+                        continue
+                    _keys: list[str] = []
+                    for _k in (_t.get("security"), _t.get("symbol"), _t.get("nse_ticker"), _t.get("isin")):
+                        _kk = str(_k or "").strip().upper()
+                        if _kk and _kk not in _keys:
+                            _keys.append(_kk)
+                    for _k in _keys:
+                        if _wl_base(_k) == _base:
+                            _hits += 1
+                            break
+                return min(_hits, 2)
+
+            _wl_out: list[dict] = []
+            for _tk in _wl_tickers:
+                _strike = _wl_strike_count(_tk)
+                if _strike < 1:
+                    continue  # only tickers that actually stopped out enter the watchlist
+                try:
+                    _series = [float(x) for x in (px.series(_tk, as_of) or []) if x is not None]
+                    _cmp_v = _series[-1] if _series else None
+                    _dma50 = s4._sma(_series, int(getattr(s4, "DMA_SHORT", 50)))
+                    _dma200 = s4._sma(_series, int(getattr(s4, "DMA_LONG", 200)))
+                    _px_vs_dma = None
+                    if _cmp_v and _dma200:
+                        _px_vs_dma = round((float(_cmp_v) - float(_dma200)) / float(_dma200) * 100.0, 2)
+                    _gold = bool(_dma50 and _dma200 and float(_dma50) > float(_dma200))
+                    if _strike >= 2:
+                        _status = "DROPPED (2 STRIKES)"
+                    elif _strike == 1:
+                        _status = "QUARANTINE"
+                    else:
+                        _status = "RE-ENTRY READY"
+                    _wl_out.append({
+                        "Ticker": _tk,
+                        "Status": _status,
+                        "Strike Count": int(_strike),
+                        "Price vs. DMA200 (%)": _px_vs_dma,
+                        "DMA50 > DMA200 (Golden Cross)": bool(_gold),
+                    })
+                except Exception:  # noqa: BLE001
+                    st.caption("Quarantine & Re-Entry watchlist unavailable (missing price history).")
+            if _wl_out:
+                st.dataframe(pd.DataFrame(_wl_out), hide_index=True, width="stretch")
+                st.caption("1st stop-loss exit -> QUARANTINE (SIPs blocked until golden cross); re-entry after golden cross resets the strike; 2nd stop-loss -> DROPPED (2 STRIKES) permanently.")
+            else:
+                st.caption("No stopped-out tickers in the current watchlist — nothing in Quarantine / Two-Strikes.")
+        except Exception:  # noqa: BLE001
+            st.caption("Quarantine & Re-Entry watchlist unavailable (missing price history).")
+
     # ---- Smart New-Stock Entry & Incubation Pacing (Stage 4C enhancement) ---------------------
     def _import_inc_price(_query, start, end):
         """Fetch + persist prices under the canonical NSE ticker (ISIN-aware)."""
@@ -2358,7 +2435,7 @@ def _render_stage4_planner(ctx: AppContext) -> None:
 
 
 def _run_stage4_backtest_once(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
-                              trim_aer=2.20, trim_target_mult=1.40):
+                              trim_aer=2.20, trim_target_mult=1.40, enable_quarantine_reentry=False):
     """Run one walk-forward backtest simulation (uncached entry point)."""
     import json
 
@@ -2374,6 +2451,7 @@ def _run_stage4_backtest_once(years_val, include_wl, include_closed, md_path, tx
         max_monthly_ceiling=200000.0,
         trim_aer=float(trim_aer),
         trim_target_mult=float(trim_target_mult),
+        enable_quarantine_reentry=bool(enable_quarantine_reentry),
         market_db_path=md_path,
     )
     txs_loaded = json.loads(txs_json) if txs_json else []
@@ -2388,11 +2466,12 @@ def _run_stage4_backtest_once(years_val, include_wl, include_closed, md_path, tx
 
 @st.cache_data(show_spinner="Running walk-forward backtest...")
 def _run_stage4_backtest_cached(years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
-                                trim_aer=2.20, trim_target_mult=1.40):
+                                trim_aer=2.20, trim_target_mult=1.40, enable_quarantine_reentry=False):
     """Cached wrapper around run_backtest() (module-level so st.cache_data persists)."""
     return _run_stage4_backtest_once(
         years_val, include_wl, include_closed, md_path, txs_json, holdings_json,
         trim_aer=trim_aer, trim_target_mult=trim_target_mult,
+        enable_quarantine_reentry=bool(enable_quarantine_reentry),
     )
 
 
@@ -2448,6 +2527,11 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         export_btn = st.button(
             "Export AI Report (All Horizons .md)", key="s4e_export", use_container_width=True,
         )
+    q_re = st.checkbox(
+        "Quarantine + Golden-Cross Re-Entry (2-Strikes)",
+        value=False, key="s4e_quarantine_reentry",
+        help="Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes lifecycle for stop-loss exits.",
+    )
 
     txs = ctx.txs
     holdings = ctx.holdings
@@ -2560,6 +2644,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
                                                     "max_monthly_ceiling": 200000.0,
                                                     "trim_aer": 1.85,
                                                     "trim_target_mult": 1.0,
+                                                    "enable_quarantine_reentry": bool(q_re),
                                                     "market_db_path": ctx.market_db_path,
                                                     "start_date": None})()
                             res = _run(cfg, ctx.market_db_path, ctx.txs, None)
@@ -2609,7 +2694,8 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         with st.spinner("Simulating base portfolio..."):
             try:
                 res_main = _run_stage4_backtest_once(
-                    int(years), False, include_closed, market_db, txs_json, holdings_json)
+                    int(years), False, include_closed, market_db, txs_json, holdings_json,
+                    enable_quarantine_reentry=bool(q_re))
             except Exception as e:  # noqa: BLE001
                 st.error(f"Backtest unavailable: {e}")
                 return
@@ -2629,7 +2715,8 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             with st.spinner("Simulating with watchlist additions..."):
                 try:
                     res_wl = _run_stage4_backtest_once(
-                        int(years), True, include_closed, market_db, txs_json, holdings_json)
+                        int(years), True, include_closed, market_db, txs_json, holdings_json,
+                        enable_quarantine_reentry=bool(q_re))
                 except Exception as e:  # noqa: BLE001
                     st.error(f"Watchlist comparison unavailable: {e}")
                     return

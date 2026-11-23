@@ -1309,3 +1309,193 @@ def test_monthly_step_cash_never_negative_after_friction(monkeypatch):
     deployed = sum(st.invested for st in states)
     assert deployed <= 1000.0 + 1e-6, f"deployed {deployed:,.0f} > ₹1000 cash"
 
+
+# ---------------------------------------------------------------------------
+# Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes lifecycle (Stage 4C)
+# ---------------------------------------------------------------------------
+def test_stop_loss_first_strike_moves_to_quarantine_and_blocks_sip(monkeypatch):
+    """Strike 1: the first stop-loss exit moves the ticker to QUARANTINE and blocks
+    fresh Stage 4C SIP allocations until a golden cross confirms the trend reclaim."""
+    from datetime import date, timedelta
+
+    from performance import stage4_backtest as s4b
+    from performance.stage4_backtest import BacktestConfig, _Lot, _StockState
+
+    d = date(2025, 6, 1)
+    series = [(d - timedelta(days=259 - i), 100.0) for i in range(260)]
+    series[-1] = (d, 50.0)  # GTT.NS crashes to 50 on the monthly review day -> GTT breach
+    prices = _StubPrices({"Q.NS": series, "^CRSLDX": [(d - timedelta(days=800), 100.0), (d, 100.0)]})
+    cfg = BacktestConfig(base_unit_sip=10000.0, max_monthly_ceiling=200000.0,
+                         enable_quarantine_reentry=True)
+
+    def _rows(stocks, totals, bx, as_of_date=None, **kw):
+        return [{"security_id": "Q.NS", "signal_type": "GTT_STOP_LOSS", "cmp": 50.0,
+                 "gtt_stop_loss_price": 60.0, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows)
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation",
+                        lambda *a, **k: {"rows": [], "total_allocated": 0.0,
+                                         "natural_total_sip": 0.0, "parked_cash": 0.0,
+                                         "scaled_down": False})
+
+    st = _StockState(ticker="Q.NS", isin=None, first_buy_date=date(2025, 1, 2), sources={"active"})
+    st.activation_date = date(2025, 1, 2)
+    st.lots = [_Lot(qty=10.0, price=100.0, date=date(2025, 1, 2))]
+    st.peak_price = 100.0
+    st.gtt = 60.0
+
+    stats = {"friction": 0.0, "taxes": 0.0, "sells": {}}
+    rd = {"pending": 0.0, "release": {}, "nifty500_peak": 100.0}
+    s4b._monthly_step([st], prices, d, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+
+    assert st.quarantine is True
+    assert st.strike_count == 1
+    assert st.frozen is True
+    assert st.qty == 0.0
+    assert stats["sells"]["GTT_STOP_LOSS"]["count"] == 1
+    assert st.sip_multiplier == 0.0  # quarantined -> SIP allocation blocked
+
+
+def test_quarantine_blocks_reentry_until_golden_cross(monkeypatch):
+    """A QUARANTINEd ticker stays blocked while the trend is not reclaimed
+    (Close <= DMA200 or DMA50 <= DMA200) and never re-enters during the cooling-off."""
+    from datetime import date, timedelta
+
+    from performance import stage4_backtest as s4b
+    from performance.stage4_backtest import BacktestConfig, _Lot, _StockState
+
+    d_exit = date(2025, 6, 1)
+    d2 = date(2025, 12, 1)  # monthly review day, > exit + 90d cooling-off
+    series = [(d_exit - timedelta(days=259 - i), 100.0) for i in range(260)]
+    series[-1] = (d_exit, 50.0)
+    prices = _StubPrices({"Q.NS": series, "^CRSLDX": [(d_exit - timedelta(days=800), 100.0), (d_exit, 100.0)]})
+    cfg = BacktestConfig(base_unit_sip=10000.0, max_monthly_ceiling=200000.0,
+                         enable_quarantine_reentry=True)
+
+    def _rows(stocks, totals, bx, as_of_date=None, **kw):
+        # Broken trend: CMP (50) <= DMA200 (80) -> no golden cross -> stay quarantined.
+        return [{"security_id": "Q.NS", "signal_type": "NO_SIGNAL", "cmp": 50.0,
+                 "gtt_stop_loss_price": None, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows)
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation",
+                        lambda *a, **k: {"rows": [], "total_allocated": 0.0,
+                                         "natural_total_sip": 0.0, "parked_cash": 0.0,
+                                         "scaled_down": False})
+
+    st = _StockState(ticker="Q.NS", isin=None, first_buy_date=date(2025, 1, 2), sources={"active"})
+    st.activation_date = date(2025, 1, 2)
+    st.lots = [_Lot(qty=0.0, price=100.0, date=date(2025, 1, 2))]
+    st.quarantine = True
+    st.strike_count = 1
+    st.frozen = True
+    st.cooldown_until = d_exit + timedelta(days=95)
+
+    stats = {"friction": 0.0, "taxes": 0.0, "sells": {}}
+    rd = {"pending": 0.0, "release": {}, "nifty500_peak": 100.0}
+    s4b._monthly_step([st], prices, d2, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+
+    assert st.quarantine is True
+    assert st.strike_count == 1
+    assert st.sip_multiplier == 0.0
+    assert stats["lifecycle"]["reentered_count"] == 0
+
+
+def test_quarantine_reenters_on_golden_cross_after_cooldown(monkeypatch):
+    """A QUARANTINEd ticker unlocks for re-entry once the monthly review happens after
+    the cooling-off AND the trend is reclaimed (Close > DMA200 AND DMA50 > DMA200)."""
+    from datetime import date, timedelta
+
+    from performance import stage4_backtest as s4b
+    from performance.stage4_backtest import BacktestConfig, _Lot, _StockState
+
+    d_exit = date(2025, 6, 1)
+    d2 = date(2025, 12, 1)  # > exit + 90d cooling-off
+    series = [(d_exit - timedelta(days=259 - i), 100.0) for i in range(260)]
+    series[-1] = (d_exit, 50.0)
+    series.append((d2, 100.0))  # reclaimed price on the re-entry review day
+    prices = _StubPrices({"Q.NS": series, "^CRSLDX": [(d_exit - timedelta(days=800), 100.0), (d_exit, 100.0), (d2, 100.0)]})
+    cfg = BacktestConfig(base_unit_sip=10000.0, max_monthly_ceiling=200000.0,
+                         enable_quarantine_reentry=True)
+
+    def _rows(stocks, totals, bx, as_of_date=None, **kw):
+        # Reclaimed trend: CMP (100) > DMA200 (80) AND DMA50 (90) > DMA200 (80) -> golden cross.
+        return [{"security_id": "Q.NS", "signal_type": "NO_SIGNAL", "cmp": 100.0,
+                 "gtt_stop_loss_price": None, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows)
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation",
+                        lambda *a, **k: {"rows": [{"security_id": "Q.NS", "recommended_sip_rupees": 10000.0}],
+                                         "total_allocated": 10000.0, "natural_total_sip": 10000.0,
+                                         "parked_cash": 0.0, "scaled_down": False})
+
+    st = _StockState(ticker="Q.NS", isin=None, first_buy_date=date(2025, 1, 2), sources={"active"})
+    st.activation_date = date(2025, 1, 2)
+    st.lots = [_Lot(qty=0.0, price=100.0, date=date(2025, 1, 2))]
+    st.quarantine = True
+    st.strike_count = 1
+    st.frozen = True
+    st.cooldown_until = d_exit + timedelta(days=95)
+
+    stats = {"friction": 0.0, "taxes": 0.0, "sells": {}}
+    rd = {"pending": 0.0, "release": {}, "nifty500_peak": 100.0}
+    s4b._monthly_step([st], prices, d2, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+
+    assert st.quarantine is False
+    assert st.strike_count == 0
+    assert st.frozen is False
+    assert stats["lifecycle"]["reentered_count"] == 1
+
+
+def test_second_stop_loss_drops_ticker_after_reentry(monkeypatch):
+    """Strike 2: a re-entered ticker that stops out again is permanently marked
+    DROPPED_TWO_STRIKES and blocked from future SIPs / re-entry."""
+    from datetime import date, timedelta
+
+    from performance import stage4_backtest as s4b
+    from performance.stage4_backtest import BacktestConfig, _Lot, _StockState
+
+    d = date(2025, 6, 1)
+    series = [(d - timedelta(days=259 - i), 100.0) for i in range(260)]
+    series[-1] = (d, 50.0)  # GTT breach on the monthly review day
+    prices = _StubPrices({"Q.NS": series, "^CRSLDX": [(d - timedelta(days=800), 100.0), (d, 100.0)]})
+    cfg = BacktestConfig(base_unit_sip=10000.0, max_monthly_ceiling=200000.0,
+                         enable_quarantine_reentry=True)
+
+    def _rows(stocks, totals, bx, as_of_date=None, **kw):
+        return [{"security_id": "Q.NS", "signal_type": "GTT_STOP_LOSS", "cmp": 50.0,
+                 "gtt_stop_loss_price": 60.0, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows)
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation",
+                        lambda *a, **k: {"rows": [], "total_allocated": 0.0,
+                                         "natural_total_sip": 0.0, "parked_cash": 0.0,
+                                         "scaled_down": False})
+
+    # A re-entered stock is armed for Strike 2 (quarantine was cleared via golden cross).
+    st = _StockState(ticker="Q.NS", isin=None, first_buy_date=date(2025, 1, 2), sources={"active"})
+    st.activation_date = date(2025, 1, 2)
+    st.lots = [_Lot(qty=10.0, price=100.0, date=date(2025, 1, 2))]
+    st.peak_price = 100.0
+    st.gtt = 60.0
+    st.quarantine = False
+    st.strike_count = 1  # re-entered after Strike 1 -> next stop-loss is Strike 2
+    st.frozen = False
+
+    stats = {"friction": 0.0, "taxes": 0.0, "sells": {}}
+    rd = {"pending": 0.0, "release": {}, "nifty500_peak": 100.0}
+    s4b._monthly_step([st], prices, d, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+
+    assert st.dropped_two_strikes is True
+    assert st.permanent_exited is True
+    assert st.strike_count == 2
+    assert st.sip_multiplier == 0.0
+

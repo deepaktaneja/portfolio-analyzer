@@ -271,6 +271,7 @@ class BacktestConfig:
     trim_target_mult: float = TRIM_TARGET_MULT
     market_db_path: str | None = None
     start_date: str | None = None  # optional explicit backtest start (ISO)
+    enable_quarantine_reentry: bool = False  # Exit -> Quarantine -> Golden-Cross Re-Entry
 
     def __post_init__(self):
         try:
@@ -279,6 +280,10 @@ class BacktestConfig:
             self.years = 7
         if self.years not in VALID_YEARS:
             self.years = 7
+        try:
+            self.enable_quarantine_reentry = bool(self.enable_quarantine_reentry)
+        except (TypeError, ValueError):
+            self.enable_quarantine_reentry = False
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +489,9 @@ class _StockState:
     gross_proceeds: float = 0.0  # gross rupees from sells/trims (before friction & tax)
     trades: int = 0
     sip_multiplier: float = 0.0  # last evaluated SIP multiplier (0.0 = not eligible)
+    strike_count: int = 0        # stop-loss exit strikes: 1 -> QUARANTINE, 2 -> DROPPED_TWO_STRIKES
+    quarantine: bool = False     # Strike-1: stopped out, awaiting golden-cross re-entry
+    dropped_two_strikes: bool = False  # Strike-2: permanently blocked after second stop
 
     @property
     def qty(self) -> float:
@@ -965,6 +973,61 @@ def _gtt_stop_allowed(st: _StockState, px: float, prices: PriceIndex,
     return (stock_dd - nifty_dd) >= GTT_STOP_LOSS_MIN_NIFTY_LAG
 
 
+def _lifecycle_stats(stats: dict) -> dict:
+    """Per-run Exit -> Quarantine -> Re-Entry -> Two-Strikes diagnostics."""
+    lg = stats.setdefault("lifecycle", {
+        "quarantined_count": 0,
+        "reentered_count": 0,
+        "dropped_two_strikes": 0,
+    })
+    lg.setdefault("quarantined_count", 0)
+    lg.setdefault("reentered_count", 0)
+    lg.setdefault("dropped_two_strikes", 0)
+    return lg
+
+
+def _apply_stop_loss_strike(st: _StockState, reason: str, d: date, enable_lifecycle: bool,
+                            lg: dict) -> None:
+    """Record a stop-loss exit strike against ``st`` (Exit -> Quarantine ...).
+
+    With ``enable_lifecycle`` disabled the locked behaviour is preserved: a
+    HARD_STOP_LOSS permanent lockout (never re-enter) and a GTT_STOP_LOSS
+    cooldown (90 days). With the lifecycle enabled:
+
+    - Strike 1 (first stop-loss exit): the ticker moves to ``QUARANTINE`` and
+      fresh Stage 4C SIP allocations are blocked (frozen + cooling-off window).
+      ``lifecycle["quarantined_count"]`` increments.
+    - Strike 2 (second stop-loss exit, only reachable after a golden-cross
+      re-entry cleared the quarantine): the ticker is marked
+      ``DROPPED_TWO_STRIKES`` and permanently blocked from future SIPs/re-entry.
+      ``lifecycle["dropped_two_strikes"]`` increments.
+    """
+    if not enable_lifecycle:
+        if reason == HARD_STOP_LOSS:
+            st.permanent_exited = True
+            st.frozen = True
+        else:
+            st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
+            st.frozen = True
+        return
+    prev_quarantined = bool(st.quarantine)
+    st.strike_count = int(getattr(st, "strike_count", 0) or 0) + 1
+    if st.strike_count >= 2:
+        st.dropped_two_strikes = True
+        st.permanent_exited = True
+        st.frozen = True
+        st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
+        st.sip_multiplier = 0.0
+        lg["dropped_two_strikes"] = int(lg.get("dropped_two_strikes") or 0) + 1
+        return
+    st.quarantine = True
+    st.frozen = True
+    st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
+    st.sip_multiplier = 0.0
+    if not prev_quarantined:
+        lg["quarantined_count"] = int(lg.get("quarantined_count") or 0) + 1
+
+
 def _aer_stats(values) -> dict:
     """Diagnostic: min / median / max of observed AER values (pure reporting)."""
     vals = sorted(float(v) for v in (values or []) if v is not None)
@@ -1005,6 +1068,7 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
     if rd is not None:
         released = rd.get("release", {}).pop((d.year, d.month), 0.0)
         rd["pending"] = max(0.0, rd.get("pending", 0.0) - released)
+    lg = _lifecycle_stats(stats)
     active = [st for st in states
               if st.activation_date is not None and st.activation_date <= d]
     if not active:
@@ -1036,8 +1100,12 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
     # trading day. Unactivated states keep the dataclass default of 0.0.
     for st in states:
         if st.activation_date is not None:
-            st.sip_multiplier = row_by_ticker.get(st.ticker, {}).get(
-                "sip_multiplier", 0.0) or 0.0
+            _mult = row_by_ticker.get(st.ticker, {}).get("sip_multiplier", 0.0) or 0.0
+            if st.quarantine or st.dropped_two_strikes:
+                # QUARANTINE (Strike 1) / DROPPED_TWO_STRIKES (Strike 2): no fresh
+                # Stage 4C SIP allocation until / unless the lifecycle clears them.
+                _mult = 0.0
+            st.sip_multiplier = _mult
 
     # ---- Market crash freeze (Exp #8 diagnostic): Nifty 500 trailing-52w-high ----
     # A drawdown < -20% from the trailing 52-week high marks a broad market crash;
@@ -1086,10 +1154,16 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
             if not (dma200 and cmp < dma200) or (stock_dd - nifty_dd) < 0.25:
                 continue  # not a stock-specific collapse below 200-DMA -> hold
             cash += _book_proceeds(_apply_sell(st, d, cmp, 1.0, tax_state, stats, HARD_STOP_LOSS), d, rd)
-            # Permanent lockout: a broken story (Yes Bank / PI Industries) is
-            # never re-entered for the rest of the simulation.
-            st.permanent_exited = True
-            st.frozen = True
+            # Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes lifecycle
+            # (optional; the locked default keeps the permanent lockout after a
+            # HARD_STOP_LOSS so the historical behaviour is 100% preserved).
+            if config.enable_quarantine_reentry:
+                _apply_stop_loss_strike(st, HARD_STOP_LOSS, d, True, lg)
+            else:
+                # Permanent lockout: a broken story (Yes Bank / PI Industries) is
+                # never re-entered for the rest of the simulation.
+                st.permanent_exited = True
+                st.frozen = True
         elif sig == CONCENTRATION_TRIM:
             shares = _finite(row.get("shares_to_sell"), 0.0) or 0.0
             if shares > 0:
@@ -1131,8 +1205,11 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
         if not _gtt_stop_allowed(st, cmp_gtt, prices, d, rd):
             continue  # broad-market pullback -> hold healthy names
         cash += _book_proceeds(_apply_sell(st, d, cmp_gtt, 1.0, tax_state, stats, GTT_STOP_LOSS), d, rd)
-        st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
-        st.frozen = True
+        if config.enable_quarantine_reentry:
+            _apply_stop_loss_strike(st, GTT_STOP_LOSS, d, True, lg)
+        else:
+            st.cooldown_until = d + timedelta(days=COOLDOWN_DAYS)
+            st.frozen = True
 
     # ---- Bottom-up conviction SIPs (Rs 3L is a ceiling, not a target) ----
     sip_rows = [{
@@ -1195,11 +1272,23 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
             continue  # permanent lockout after HARD_STOP_LOSS — never re-enter
         # Confirmed golden-cross uptrend reclaim: CMP > 200-DMA AND 50-DMA > 200-DMA.
         golden_cross = bool(dma200 and dma50 and px > dma200 and dma50 > dma200)
-        if st.cooldown_until is not None:
-            if d <= st.cooldown_until:
-                continue  # 90-day cooling-off period after LAGGARD_EXIT
-            if not golden_cross:
-                continue  # broken stock stays blocked until trend reclaimed
+        if st.quarantine and st.cooldown_until is not None and d > st.cooldown_until and golden_cross:
+            # Mechanical re-entry (Exit -> Quarantine -> Golden-Cross Re-Entry):
+            # a QUARANTINEd ticker becomes SIP-eligible again on a monthly review
+            # date only once the trend is reclaimed (Close > DMA200 AND
+            # DMA50 > DMA200).
+            lg["reentered_count"] = int(lg.get("reentered_count") or 0) + 1
+            st.quarantine = False
+            st.strike_count = 0  # re-armed: next stop-loss exit is Strike 2
+            st.cooldown_until = None
+            st.frozen = False
+        if st.dropped_two_strikes:
+            continue  # permanently blocked after the second stop-loss strike
+        if st.cooldown_until is not None and d <= st.cooldown_until:
+            continue  # 90-day cooling-off period after LAGGARD_EXIT
+        if st.cooldown_until is not None and not golden_cross:
+            continue  # broken stock stays blocked until trend reclaimed
+        if st.cooldown_until is not None and d > st.cooldown_until and golden_cross:
             st.cooldown_until = None
             st.frozen = False
         before_q = st.qty
@@ -1230,6 +1319,7 @@ def _config_dict(config: BacktestConfig) -> dict:
         "max_monthly_ceiling": float(config.max_monthly_ceiling),
         "trim_aer": float(config.trim_aer),
         "trim_target_mult": float(config.trim_target_mult),
+        "enable_quarantine_reentry": bool(getattr(config, "enable_quarantine_reentry", False)),
     }
 
 
@@ -1360,6 +1450,7 @@ def _empty_result(config: BacktestConfig, sim_tickers) -> dict:
         "aer_stats": {"count": 0, "min": None, "median": None, "max": None},
         "cash_idle": {"total": 0, "no_eligible": 0,
                       "budget_limited": 0, "per_stock_caps": 0},
+        "lifecycle": {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0},
     }
 
 
@@ -1575,6 +1666,7 @@ def run_backtest(config: BacktestConfig | None = None, market_db_path=None,
         "crash_freeze": stats.get("crash_freeze") or {"months": [], "nifty_dd": None, "triggered": 0,
                                                       "suppressed_gtt": 0, "suppressed_laggard": 0,
                                                       "drawdowns": []},
+        "lifecycle": stats.get("lifecycle") or {"quarantined_count": 0, "reentered_count": 0, "dropped_two_strikes": 0},
         "calendar_year_returns": _calendar_year_returns(monthly_out, contributions,
                                                         year_trading_days),
         "attribution": _build_attribution(states, prices, data_end),
