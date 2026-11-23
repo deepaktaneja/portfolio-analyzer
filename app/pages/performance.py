@@ -1863,6 +1863,31 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     f = ctx.filters
     st.markdown("#### Stage 4C - Monthly SIP & GTT Protection Planner")
     st.caption("Plan this month's SIP deployment and verify broker GTT orders. Advisory only - nothing is executed.")
+
+    with st.expander("📋 15-Minute Monthly Review Checklist (SOP)", expanded=False):
+        st.caption(
+            "*Run once a month on your review date. Follow in order — 100% rule-based, zero overrides.*")
+        _sop_steps = [
+            (1, "Sync Holdings & Prices", "Import trades, refresh prices; click Fetch Missing Prices if N/A.", 2),
+            (2, "Check Market Regime", "Nifty 500 down ≥15% from peak? Crash-freeze check before acting.", 1),
+            (3, "Process Exits & Trims First", "Review GTT / LAGGARD / CONCENTRATION trims; sells recycle capital.", 4),
+            (4, "Audit Quarantine & Re-Entry Watchlist", "QUARANTINE / DROPPED (2 STRIKES): ₹0 SIP; note RE-ENTRY READY.", 2),
+            (5, "Deploy Monthly SIPs", "Buy per Stage 4C recommended SIP within monthly ceiling.", 4),
+            (6, "Set / Trail Broker GTTs", "Place / trail GTT stop-loss for new buys and updated peaks.", 2),
+        ]
+        _sop_completed = 0
+        for _i, _title, _desc, _budget in _sop_steps:
+            _key = f"s4c_sop_step_{_i}"
+            _checked = bool(st.session_state.get(_key, False))
+            st.checkbox(f"Step {_i} — {_title} ({_budget} min)", value=_checked, key=_key)
+            st.caption(_desc)
+            _sop_completed += int(_checked)
+        st.progress(_sop_completed / len(_sop_steps))
+        st.caption(f"{_sop_completed}/6 steps completed")
+        if st.button("Reset Checklist", key="s4c_sop_reset"):
+            for _i in range(1, 7):
+                st.session_state[f"s4c_sop_step_{_i}"] = False
+
     if not txs:
         st.info("No equity transactions available.")
         return
@@ -2565,6 +2590,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
         years=years_int,
         compare_watchlist=False,
         include_closed=include_closed_bool,
+        enable_quarantine_reentry=bool(q_re),
     )
     cached_wl = None
     if compare_wl:
@@ -2574,6 +2600,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             years=years_int,
             compare_watchlist=True,
             include_closed=include_closed_bool,
+            enable_quarantine_reentry=bool(q_re),
         )
 
     res_main = None
@@ -2630,6 +2657,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
                     cached, _ = load_backtest_cache(
                         cache_dir, person_id=person_id, years=h,
                         compare_watchlist=False, include_closed=include_closed_bool,
+                        enable_quarantine_reentry=bool(q_re),
                     )
                     if cached is not None:
                         results_by_horizon[h] = cached
@@ -2708,6 +2736,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
             compare_watchlist=False,
             include_closed=include_closed_bool,
             data_signature=data_signature,
+            enable_quarantine_reentry=bool(q_re),
         )
         res_wl = None
 
@@ -2729,6 +2758,7 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
                 compare_watchlist=True,
                 include_closed=include_closed_bool,
                 data_signature=data_signature,
+                enable_quarantine_reentry=bool(q_re),
             )
 
     skipped = res_main.get("universe", {}).get("skipped_tickers", [])
@@ -2838,6 +2868,20 @@ def _render_stage4_backtester(ctx: AppContext) -> None:
     )
     fig.update_yaxes(tickprefix="INR ")
     st.plotly_chart(fig, width="stretch")
+
+    # Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes lifecycle summary
+    # (Backtester only; UI-only diagnostics when the lifecycle mode is enabled).
+    if bool(q_re) and res_main is not None:
+        _lg = res_main.get("lifecycle") or {}
+        _q_strike1 = _lg.get("quarantined_count") or 0
+        _re_entered = _lg.get("reentered_count") or 0
+        _dropped_two = _lg.get("dropped_two_strikes") or 0
+        st.markdown(
+            "**Lifecycle (Exit -> Quarantine -> Golden-Cross Re-Entry -> 2-Strikes):** "
+            f"Quarantined (Strike 1): **{_q_strike1}** | "
+            f"Re-Entered (Golden Cross): **{_re_entered}** | "
+            f"Dropped (2 Strikes): **{_dropped_two}**"
+        )
 
     st.markdown("#### Comparison Scorecard")
     sc_rows = []

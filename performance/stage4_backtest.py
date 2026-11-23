@@ -95,6 +95,7 @@ def backtest_cache_key(
     include_closed: bool = True,
     *,
     horizon_years: int | None = None,
+    enable_quarantine_reentry: bool = False,
 ) -> str:
     """Build a deterministic cache key from run settings."""
     effective_years = int(horizon_years if horizon_years is not None else years)
@@ -104,6 +105,7 @@ def backtest_cache_key(
             "horizon_years": effective_years,
             "compare_watchlist": bool(compare_watchlist),
             "include_closed": bool(include_closed),
+            "enable_quarantine_reentry": bool(enable_quarantine_reentry),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -155,6 +157,7 @@ def save_backtest_result(
     include_closed: bool = True,
     data_signature: str | None = None,
     saved_at: str | None = None,
+    enable_quarantine_reentry: bool = False,
 ) -> Path:
     """Persist a backtest result together with lightweight run metadata."""
     directory = backtest_cache_dir(cache_dir)
@@ -164,6 +167,7 @@ def save_backtest_result(
         years=years,
         compare_watchlist=compare_watchlist,
         include_closed=include_closed,
+        enable_quarantine_reentry=enable_quarantine_reentry,
     )
     metadata = {
         "version": BACKTEST_CACHE_VERSION,
@@ -172,6 +176,7 @@ def save_backtest_result(
         "years": int(years),
         "compare_watchlist": bool(compare_watchlist),
         "include_closed": bool(include_closed),
+        "enable_quarantine_reentry": bool(enable_quarantine_reentry),
         "data_signature": data_signature or compute_backtest_data_signature(),
         "saved_at": saved_at or datetime.now().astimezone().isoformat(),
     }
@@ -191,6 +196,8 @@ def load_backtest_cache(
     years: int = 7,
     compare_watchlist: bool = False,
     include_closed: bool = True,
+    enable_quarantine_reentry: bool = False,
+    data_signature: str | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Load one saved backtest result and its metadata, if present and valid."""
     directory = backtest_cache_dir(cache_dir)
@@ -199,6 +206,7 @@ def load_backtest_cache(
         years=years,
         compare_watchlist=compare_watchlist,
         include_closed=include_closed,
+        enable_quarantine_reentry=enable_quarantine_reentry,
     )
     path = directory / f"backtest_{key}.json"
     if not path.is_file():
@@ -213,6 +221,8 @@ def load_backtest_cache(
             return None, None
         if metadata.get("version") != BACKTEST_CACHE_VERSION or metadata.get("key") != key:
             return None, None
+        if data_signature is not None and metadata.get("data_signature") != data_signature:
+            return None, None
         return result, metadata
     except (OSError, TypeError, ValueError):
         return None, None
@@ -226,6 +236,7 @@ def load_backtest_result(
     compare_watchlist: bool = False,
     include_closed: bool = True,
     data_signature: str | None = None,
+    enable_quarantine_reentry: bool = False,
 ) -> dict | None:
     """Load a backtest result after validating cache schema and data freshness."""
     result, metadata = load_backtest_cache(
@@ -234,10 +245,10 @@ def load_backtest_result(
         years=years,
         compare_watchlist=compare_watchlist,
         include_closed=include_closed,
+        enable_quarantine_reentry=enable_quarantine_reentry,
+        data_signature=data_signature,
     )
     if result is None or metadata is None:
-        return None
-    if data_signature is not None and metadata.get("data_signature") != data_signature:
         return None
     return result
 

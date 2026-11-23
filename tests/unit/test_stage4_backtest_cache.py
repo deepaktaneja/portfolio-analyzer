@@ -72,3 +72,34 @@ def test_backtest_cache_corrupt_file_falls_back(tmp_path):
         data_signature="price-signature-v3",
     )
     assert loaded is None
+
+
+def test_backtest_cache_key_differs_when_quarantine_reentry_enabled(tmp_path):
+    from performance.stage4_backtest import (
+        backtest_cache_key,
+        load_backtest_result,
+        save_backtest_result,
+    )
+
+    key_off = backtest_cache_key(person_id=42, years=5, enable_quarantine_reentry=False)
+    key_on = backtest_cache_key(person_id=42, years=5, enable_quarantine_reentry=True)
+    assert key_on != key_off
+
+    result = {"scorecard": {"final_net_value": 321.0}}
+    saved = save_backtest_result(
+        result,
+        cache_dir=tmp_path,
+        person_id=42,
+        years=5,
+        enable_quarantine_reentry=True,
+        data_signature="price-signature-v4",
+    )
+    assert saved == tmp_path / f"backtest_{key_on}.json"
+
+    assert load_backtest_result(
+        tmp_path,
+        person_id=42,
+        years=5,
+        enable_quarantine_reentry=True,
+        data_signature="price-signature-v4",
+    ) == result
