@@ -1558,14 +1558,37 @@ def _render_stage4_action_center(ctx: AppContext) -> None:
 
     as_of = f.end_date or _d.today()
     px = s4.make_adjusted_close_lookup(ctx.market_db_path)
+    # Wrap the price lookup so ISIN-keyed holdings resolve to the ticker under
+    # which prices are actually stored (e.g. ISIN INE284S01014 -> ticker ZENTEC.BO).
+    # Stage 4C stores prices under the canonical NSE ticker, not under the ISIN.
+    from market_data.prices import normalize_security_id as _norm_sid
+    _base_series = px.series
+    _base_price = px
+
+    def _px_series(sid, ad):
+        ident = _norm_sid(sid, db_path=ctx.market_db_path)
+        for alias in (ident.get("aliases") or [sid]):
+            series = _base_series(alias, ad)
+            if series:
+                return series
+        return _base_series(sid, ad)
+
+    def _px_price(sid, dt):
+        series = _px_series(sid, dt)
+        return series[-1] if series else None
+
+    px = _px_price
+    px.series = _px_series
 
     active_isins = []
     try:
         if ctx.holdings is not None and not ctx.holdings.empty:
             for _, r in ctx.holdings.iterrows():
                 if float(r.get("quantity") or 0) > 1e-6:
-                    sid = str(r.get("isin") or "").strip().upper()
-                    if sid:
+                    isin = str(r.get("isin") or "").strip().upper()
+                    sec = str(r.get("security") or r.get("symbol") or "").strip().upper()
+                    sid = isin or sec
+                    if sid and sid not in active_isins:
                         active_isins.append(sid)
     except Exception:  # noqa: BLE001
         active_isins = []
@@ -1911,6 +1934,26 @@ def _render_stage4_planner(ctx: AppContext) -> None:
 
     as_of = f.end_date or _d.today()
     px = s4.make_adjusted_close_lookup(ctx.market_db_path)
+    # Wrap the price lookup so ISIN-keyed holdings resolve to the ticker under
+    # which prices are actually stored (e.g. ISIN INE284S01014 -> ticker ZENTEC.BO).
+    from market_data.prices import normalize_security_id as _norm_sid
+    _base_series = px.series
+    _base_price = px
+
+    def _px_series(sid, ad):
+        ident = _norm_sid(sid, db_path=ctx.market_db_path)
+        for alias in (ident.get("aliases") or [sid]):
+            series = _base_series(alias, ad)
+            if series:
+                return series
+        return _base_series(sid, ad)
+
+    def _px_price(sid, dt):
+        series = _px_series(sid, dt)
+        return series[-1] if series else None
+
+    px = _px_price
+    px.series = _px_series
     # Persistent watchlist: rebuild entries from the DB so a page refresh keeps them.
     st.session_state["s4c_incubation_entries"] = _rehydrate_incubation_entries(ctx, as_of)
 
@@ -1995,6 +2038,9 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         if st.button("🔄 Sync Latest Prices", key="s4c_sync_latest_prices", use_container_width=True):
             from market_data.prices import fetch_stock_prices, resolve_provider_symbol
 
+            # Clear previously failed tickers so they are retried on this click
+            st.session_state["s4c_price_fetch_failed"] = set()
+
             _targets = list(active_isins)
             _updated = 0
             _already = 0
@@ -2038,8 +2084,27 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                             symbol=sym,
                             persist=True,
                         )
-                        if res.get("rows_fetched", 0) > 0:
+                        _n = int(res.get("rows_fetched") or 0)
+                        if _n > 0:
                             _updated += 1
+                        elif _n == 0 and ".BO" in sid:
+                            # .BO tickers often return empty from Yahoo; try .NS fallback
+                            sym_ns = sid.replace(".BO", ".NS")
+                            res2 = fetch_stock_prices(
+                                sid,
+                                start=_start,
+                                end=_end,
+                                db_path=ctx.market_db_path,
+                                symbol=sym_ns,
+                                persist=True,
+                            )
+                            _n2 = int(res2.get("rows_fetched") or 0)
+                            if _n2 > 0:
+                                _updated += 1
+                                if res2.get("errors"):
+                                    _errs.append(f"{sid}: {'; '.join(res2['errors'])}")
+                            else:
+                                _errs.append(f"{sid}: no rows from Yahoo (.BO and .NS both empty)")
                         if res.get("errors"):
                             _errs.append(f"{sid}: {'; '.join(res['errors'])}")
                     except Exception:  # noqa: BLE001
@@ -2114,7 +2179,14 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 type="primary",
                 use_container_width=True,
             ):
-                from market_data.prices import ensure_price_history
+                from market_data.prices import (
+                    ensure_price_history,
+                    fetch_stock_prices,
+                    resolve_provider_symbol,
+                )
+
+                # Clear previously failed tickers so they are retried on this click
+                st.session_state["s4c_price_fetch_failed"] = set()
 
                 with st.spinner(
                     f"Fetching price history for {len(_missing_price_tickers)} ticker(s)..."
@@ -2141,6 +2213,39 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                         + ", ".join(_res["missing"])
                         + ". Add a mapping in Data & Settings, then retry."
                     )
+                    # Try .BO -> .NS fallback for missing tickers
+                    _fb_updated = 0
+                    _fb_errs: list[str] = []
+                    _end = (_d.today() + _td(days=1)).isoformat()
+                    _start = str(_d.today() - _td(days=3 * 365))
+                    for sid in _res["missing"]:
+                        if ".BO" not in sid:
+                            _fb_errs.append(f"{sid}: no symbol mapping")
+                            continue
+                        sym_ns = sid.replace(".BO", ".NS")
+                        try:
+                            res = fetch_stock_prices(
+                                sid,
+                                start=_start,
+                                end=_end,
+                                db_path=_db_path_val,
+                                symbol=sym_ns,
+                                persist=True,
+                            )
+                            _n = int(res.get("rows_fetched") or 0)
+                            if _n > 0:
+                                _fb_updated += 1
+                            if res.get("errors"):
+                                _fb_errs.append(f"{sid}: {'; '.join(res['errors'])}")
+                        except Exception:  # noqa: BLE001
+                            _fb_errs.append(f"{sid}: fetch error")
+                    if _fb_updated:
+                        st.success(
+                            "Fetched .NS fallback history for: "
+                            + ", ".join([s for s in _res["missing"] if ".BO" in s])
+                        )
+                    if _fb_errs:
+                        st.warning("Fallback issues: " + ", ".join(_fb_errs[:5]))
                 # Clear Stage 4C cache so the table rebuilds with fresh prices
                 for _k in list(st.session_state.keys()):
                     if _k.startswith("s4c_rows"):
