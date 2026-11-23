@@ -1928,6 +1928,109 @@ def _render_stage4_planner(ctx: AppContext) -> None:
         st.info("No active equity holdings to plan for.")
         return
 
+    # ---- Price freshness indicator & Sync Latest Prices button ----
+    from datetime import timedelta as _td
+
+    from market_data.repository import MarketDataStore
+    _mds = MarketDataStore(ctx.market_db_path)
+
+    def _latest_px_date(sid: str) -> str | None:
+        try:
+            with _mds._conn() as c:
+                row = c.execute(
+                    "SELECT MAX(trade_date) FROM stock_prices WHERE security_id=? AND exchange='NSE'",
+                    (sid,),
+                ).fetchone()
+            return str(row[0]) if row and row[0] else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    _px_dates = [_latest_px_date(sid) for sid in active_isins]
+    _px_dates = [d for d in _px_dates if d]
+    _prices_as_of = max(_px_dates) if _px_dates else ""
+
+    # Most recent market date (Nifty 500 as proxy)
+    try:
+        with _mds._conn() as c:
+            row = c.execute(
+                "SELECT MAX(trade_date) FROM stock_prices WHERE security_id='^CRSLDX' AND exchange='NSE'"
+            ).fetchone()
+        _market_as_of = str(row[0]) if row and row[0] else ""
+    except Exception:  # noqa: BLE001
+        _market_as_of = ""
+
+    # Stale tickers: latest price > 5 calendar days behind market date (~2 trading days)
+    _stale: list[tuple[str, str]] = []
+    if _market_as_of and _px_dates:
+        _md = _d.fromisoformat(_market_as_of[:10])
+        _threshold = _md - _td(days=5)
+        for sid in active_isins:
+            ld = _latest_px_date(sid)
+            if ld and _d.fromisoformat(ld[:10]) < _threshold:
+                _stale.append((sid, ld))
+
+    _pf_col1, _pf_col2 = st.columns([3, 1])
+    with _pf_col1:
+        if _prices_as_of:
+            st.markdown(
+                f"**Prices as of:** {_d.fromisoformat(_prices_as_of[:10]).strftime('%d-%b-%Y')}"
+            )
+        else:
+            st.markdown("**Prices as of:** not available")
+    with _pf_col2:
+        if st.button("🔄 Sync Latest Prices", key="s4c_sync_latest_prices", use_container_width=True):
+            from market_data.prices import fetch_stock_prices, resolve_provider_symbol
+            _targets = list(active_isins) + ["^CRSLDX"]
+            _updated = 0
+            _errs: list[str] = []
+            _start = _prices_as_of or str(_d.today() - _td(days=30))
+            with st.spinner("Syncing latest prices..."):
+                for sid in _targets:
+                    try:
+                        sym = resolve_provider_symbol(sid, db_path=ctx.market_db_path)
+                        if not sym:
+                            _errs.append(sid)
+                            continue
+                        res = fetch_stock_prices(
+                            sid,
+                            start=_start,
+                            end=_d.today().isoformat(),
+                            db_path=ctx.market_db_path,
+                            symbol=sym,
+                            persist=True,
+                        )
+                        if res.get("rows_fetched", 0) > 0:
+                            _updated += 1
+                        if res.get("errors"):
+                            _errs.append(f"{sid}: {'; '.join(res['errors'])}")
+                    except Exception:  # noqa: BLE001
+                        _errs.append(f"{sid}: fetch error")
+            # Clear caches so the planner rebuilds with fresh prices
+            for _k in list(st.session_state.keys()):
+                if _k.startswith("s4c_rows"):
+                    del st.session_state[_k]
+            try:
+                _run_stage4_backtest_cached.clear()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            try:
+                _cached_data_signature.clear()  # noqa: F821
+            except Exception:  # noqa: BLE001, S110
+                pass
+            if _updated:
+                st.success(f"Synced latest prices for {_updated} ticker(s).")
+            else:
+                st.info("No new price rows fetched (already up to date).")
+            if _errs:
+                st.warning("Some tickers failed: " + ", ".join(_errs[:5]))
+            st.rerun()
+
+    if _stale:
+        _stale_list = ", ".join(f"{sid} (last: {ld[:10]})" for sid, ld in _stale)
+        st.warning(
+            f"⚠️ Stale prices — more than 2 trading days behind market ({_market_as_of[:10]}): {_stale_list}"
+        )
+
     # ---- Missing price-history banner ---------------------------------------
     # Check which active tickers lack sufficient price history in the local DB.
     # New stocks (recently bought or added to watchlist) often have no rows yet,
