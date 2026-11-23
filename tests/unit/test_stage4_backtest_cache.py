@@ -1,7 +1,4 @@
-"""Tests for the persistent Stage 4 walk-forward backtest cache."""
-
-
-def test_backtest_cache_roundtrip_and_freshness(tmp_path):
+def test_backtest_cache_round_trip_and_stale_check(tmp_path):
     from performance.stage4_backtest import (
         backtest_cache_key,
         load_backtest_result,

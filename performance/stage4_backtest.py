@@ -1290,7 +1290,11 @@ def _monthly_step(states, prices: PriceIndex, d: date, cash: float,
             # DMA50 > DMA200).
             lg["reentered_count"] = int(lg.get("reentered_count") or 0) + 1
             st.quarantine = False
-            st.strike_count = 0  # re-armed: next stop-loss exit is Strike 2
+            # Strike counter is intentionally NOT reset here: after a golden-cross
+            # re-entry the position is live again but still holds "Strike 1" armed,
+            # so the next stop-loss exit must escalate to Strike 2 (drop / permanent
+            # block) rather than restarting the quarantine ladder from Strike 1.
+            st.strike_count = int(getattr(st, "strike_count", 0) or 0) or 1
             st.cooldown_until = None
             st.frozen = False
         if st.dropped_two_strikes:

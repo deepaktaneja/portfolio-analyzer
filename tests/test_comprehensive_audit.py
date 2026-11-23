@@ -1448,7 +1448,7 @@ def test_quarantine_reenters_on_golden_cross_after_cooldown(monkeypatch):
                       monthly_inflow=0.0, rd=rd)
 
     assert st.quarantine is False
-    assert st.strike_count == 0
+    assert st.strike_count == 1  # re-entry keeps Strike 1 armed (escalates on next stop-loss)
     assert st.frozen is False
     assert stats["lifecycle"]["reentered_count"] == 1
 
@@ -1498,4 +1498,110 @@ def test_second_stop_loss_drops_ticker_after_reentry(monkeypatch):
     assert st.permanent_exited is True
     assert st.strike_count == 2
     assert st.sip_multiplier == 0.0
+
+
+def test_end_to_end_two_strike_drop_after_golden_cross_reentry(monkeypatch):
+    """Full Exit -> Quarantine -> Golden-Cross Re-Entry -> Two-Strikes sequence driven
+    purely through ``_monthly_step`` on a single ``_StockState`` (no manual ``strike_count``
+    mutation between the steps).
+
+    1. Stop-loss 1 -> ``strike_count == 1`` + QUARANTINE.
+    2. Golden-cross re-entry after the cooling-off -> QUARANTINE cleared, strike stays 1.
+    3. Stop-loss 2 -> ``strike_count == 2`` + DROPPED_TWO_STRIKES + permanent block.
+    """
+    from datetime import date, timedelta
+
+    from performance import stage4_backtest as s4b
+    from performance.stage4_backtest import BacktestConfig, _Lot, _StockState
+
+    d_exit = date(2025, 6, 1)
+    d_re = date(2025, 12, 1)   # monthly re-entry review day (> exit + 90d cooldown)
+    d2 = date(2026, 6, 1)      # second stop-loss review day, after the re-entry
+
+    series = [(d_exit - timedelta(days=259 - i), 100.0) for i in range(260)]
+    series[-1] = (d_exit, 50.0)   # Strike 1 crash -> GTT breach on the review day
+    series.append((d_re, 100.0))  # trend reclaimed on the re-entry review day
+    series.append((d2, 50.0))     # second stop-loss crash after re-entry
+    prices = _StubPrices({
+        "Q.NS": series,
+        "^CRSLDX": [(d_exit - timedelta(days=800), 100.0), (d_exit, 100.0), (d_re, 100.0), (d2, 100.0)],
+    })
+    cfg = BacktestConfig(base_unit_sip=10000.0, max_monthly_ceiling=200000.0,
+                         enable_quarantine_reentry=True)
+
+    def _rows_gtt(stocks, totals, bx, as_of_date=None, **kw):
+        # Stop-loss breach: stock -50% vs flat Nifty -> index-relative threshold crossed.
+        return [{"security_id": "Q.NS", "signal_type": "GTT_STOP_LOSS", "cmp": 50.0,
+                 "gtt_stop_loss_price": 60.0, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    def _rows_reclaimed(stocks, totals, bx, as_of_date=None, **kw):
+        # Golden cross: CMP (100) > DMA200 (80) AND DMA50 (90) > DMA200 (80).
+        return [{"security_id": "Q.NS", "signal_type": "NO_SIGNAL", "cmp": 100.0,
+                 "gtt_stop_loss_price": None, "sip_multiplier": 1.0, "incubation": False,
+                 "dma_50": 90.0, "dma_200": 80.0} for s in stocks]
+
+    def _alloc_none(*a, **k):
+        return {"rows": [], "total_allocated": 0.0, "natural_total_sip": 0.0,
+                "parked_cash": 0.0, "scaled_down": False}
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows_gtt)
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation", _alloc_none)
+
+    st = _StockState(ticker="Q.NS", isin=None, first_buy_date=date(2025, 1, 2), sources={"active"})
+    st.activation_date = date(2025, 1, 2)
+    st.lots = [_Lot(qty=10.0, price=100.0, date=date(2025, 1, 2))]
+    st.peak_price = 100.0
+    st.gtt = 60.0
+    st.invested = 1000.0
+    st.quarantine = False
+    st.strike_count = 0
+    st.frozen = False
+    st.cooldown_until = None
+    st.permanent_exited = False
+    st.sip_multiplier = 1.0
+
+    stats = {"friction": 0.0, "taxes": 0.0, "sells": {}}
+    rd = {"pending": 0.0, "release": {}, "nifty500_peak": 100.0}
+
+    # ---- Step 1: Strike 1 -> QUARANTINE (GTT stop-loss breach) -----------------
+    s4b._monthly_step([st], prices, d_exit, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+    assert st.quarantine is True
+    assert st.strike_count == 1
+    assert stats["lifecycle"]["quarantined_count"] == 1
+    assert st.dropped_two_strikes is False
+
+    # ---- Step 2: Golden-cross re-entry after the 90-day cooling-off ------------
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows_reclaimed)
+    # The re-entry lives in the bottom-up SIP buy loop, so the allocator must return
+    # at least one eligible buy row for the quarantined ticker to be re-entered.
+    monkeypatch.setattr(s4b, "compute_bottom_up_sip_allocation",
+                        lambda *a, **k: {"rows": [{"security_id": "Q.NS", "recommended_sip_rupees": 10000.0}],
+                                         "total_allocated": 10000.0, "natural_total_sip": 10000.0,
+                                         "parked_cash": 0.0, "scaled_down": False})
+    s4b._monthly_step([st], prices, d_re, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+    assert st.quarantine is False
+    assert st.frozen is False
+    assert st.strike_count == 1  # stays armed (Strike 1) across the re-entry
+    assert st.cooldown_until is None
+    assert st.permanent_exited is False
+    assert stats["lifecycle"]["reentered_count"] == 1
+
+    # ---- Step 3: Stop-loss 2 on the re-entered position -> DROP ----------------
+    st.lots = [_Lot(qty=10.0, price=100.0, date=date(2025, 1, 2))]
+    st.peak_price = 100.0
+    st.gtt = 60.0
+
+    monkeypatch.setattr(s4b, "evaluate_signals", _rows_gtt)
+    s4b._monthly_step([st], prices, d2, 0.0, cfg, {"ltcg_by_fy": {}}, None, [], stats,
+                      monthly_inflow=0.0, rd=rd)
+
+    assert st.strike_count == 2
+    assert st.dropped_two_strikes is True
+    assert st.permanent_exited is True
+    assert st.quarantine is False
+    assert st.sip_multiplier == 0.0
+    assert stats["lifecycle"]["dropped_two_strikes"] == 1
 
