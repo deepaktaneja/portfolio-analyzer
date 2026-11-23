@@ -1914,25 +1914,39 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     # Persistent watchlist: rebuild entries from the DB so a page refresh keeps them.
     st.session_state["s4c_incubation_entries"] = _rehydrate_incubation_entries(ctx, as_of)
 
+    # Build active identifiers: include ISIN-keyed holdings and ticker-keyed holdings
+    # (e.g. Order Book CSV where isin=None, security="TIPSMUSIC.NS").
     active_isins = []
     try:
         if ctx.holdings is not None and not ctx.holdings.empty:
             for _, r in ctx.holdings.iterrows():
                 if float(r.get("quantity") or 0) > 1e-6:
-                    sid = str(r.get("isin") or "").strip().upper()
-                    if sid:
+                    isin = str(r.get("isin") or "").strip().upper()
+                    sec = str(r.get("security") or r.get("symbol") or "").strip().upper()
+                    sid = isin or sec
+                    if sid and sid not in active_isins:
                         active_isins.append(sid)
     except Exception:  # noqa: BLE001
         active_isins = []
-    if not active_isins:
-        st.info("No active equity holdings to plan for.")
-        return
 
     # ---- Price freshness indicator & Sync Latest Prices button ----
     from datetime import timedelta as _td
 
     from market_data.repository import MarketDataStore
     _mds = MarketDataStore(ctx.market_db_path)
+
+    # Also include persisted watchlist stocks (incubation planner)
+    try:
+        for wl in _mds.get_watchlist_stocks():
+            tk = str(wl.get("nse_ticker") or wl.get("isin") or "").strip().upper()
+            if tk and tk not in active_isins:
+                active_isins.append(tk)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    if not active_isins:
+        st.info("No active equity holdings to plan for.")
+        return
 
     def _latest_px_date(sid: str) -> str | None:
         try:
@@ -1980,20 +1994,42 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     with _pf_col2:
         if st.button("🔄 Sync Latest Prices", key="s4c_sync_latest_prices", use_container_width=True):
             from market_data.prices import fetch_stock_prices, resolve_provider_symbol
+
             _targets = list(active_isins)
             _updated = 0
+            _already = 0
             _errs: list[str] = []
             _end = (_d.today() + _td(days=1)).isoformat()  # yfinance end is exclusive
+            _today_iso = _d.today().isoformat()
             with st.spinner("Syncing latest prices..."):
                 for sid in _targets:
                     # Use each ticker's own latest price date as the fetch start
                     _ld = _latest_px_date(sid)
-                    _start = (_d.fromisoformat(_ld[:10]) + _td(days=1)).isoformat() if _ld else str(_d.today() - _td(days=30))
+
+                    # Skip already-current tickers (no network call)
+                    if _ld and _ld[:10] >= _today_iso:
+                        _already += 1
+                        continue
+
+                    if _ld:
+                        _start = (_d.fromisoformat(_ld[:10]) + _td(days=1)).isoformat()
+                    else:
+                        # Zero rows: fetch full ~3-year history for DMA200 lookback
+                        _start = str(_d.today() - _td(days=3 * 365))
+
+                    if _start >= _end:
+                        _already += 1
+                        continue
+
                     try:
                         sym = resolve_provider_symbol(sid, db_path=ctx.market_db_path)
                         if not sym:
-                            _errs.append(f"{sid}: no symbol mapping")
-                            continue
+                            # If no symbol mapping found but sid looks like a ticker, use it directly
+                            if "." in sid or sid.startswith("^"):
+                                sym = sid
+                            else:
+                                _errs.append(f"{sid}: no symbol mapping")
+                                continue
                         res = fetch_stock_prices(
                             sid,
                             start=_start,
@@ -2024,10 +2060,13 @@ def _render_stage4_planner(ctx: AppContext) -> None:
             _px_dates2 = [_latest_px_date(sid) for sid in active_isins]
             _px_dates2 = [d for d in _px_dates2 if d]
             _latest_after = max(_px_dates2) if _px_dates2 else ""
+            _latest_str = _d.fromisoformat(_latest_after[:10]).strftime("%d-%b-%Y") if _latest_after else "n/a"
             if _updated:
-                st.success(f"Synced latest prices for {_updated} ticker(s) (latest: {_d.fromisoformat(_latest_after[:10]).strftime('%d-%b-%Y') if _latest_after else 'n/a'}).")
+                st.success(f"Updated {_updated} ticker(s), {_already} already up to date (latest: {_latest_str}).")
+            elif _already:
+                st.info(f"All {_already} ticker(s) already up to date (latest: {_latest_str}).")
             else:
-                st.info("No new price rows fetched (already up to date).")
+                st.info("No new price rows fetched.")
             if _errs:
                 st.warning("Some tickers failed: " + ", ".join(_errs[:5]))
             st.rerun()
