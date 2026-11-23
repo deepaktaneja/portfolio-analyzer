@@ -18,6 +18,45 @@ SELL_SIDES = frozenset({"REDEMPTION", "SWITCH_OUT", "SWP", "WITHDRAW", "SELL", "
 DIVIDEND_SIDES = frozenset({"IDCW", "DIVIDEND", "DIVIDEND_PAYOUT", "PAYOUT"})
 
 
+def _mf_duplicate_key(row: dict) -> tuple[str, str, str, float, float]:
+    """Build a normalized duplicate key for MF transactions."""
+    trade_date = str(row.get("trade_date") or row.get("date") or "")[:10]
+    scheme = str(row.get("scheme_code") or row.get("isin") or row.get("scheme_name") or "").strip().upper()
+    folio = str(row.get("folio") or "").strip().upper()
+    units = round(float(row.get("units") or 0), 4)
+    amount = round(float(row.get("amount") or 0), 2)
+    return (trade_date, scheme, folio, units, amount)
+
+
+def partition_new_mf_transactions(
+    rows: list[dict],
+    existing_rows: list[dict] | None = None,
+    exclude_source_file: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Split MF transactions into new and duplicate rows.
+
+    Duplicate detection uses ``(trade_date, scheme, folio, units, amount)`` after
+    normalizing dates, identifiers, units, and amounts.
+    """
+    existing_keys: set[tuple[str, str, str, float, float]] = set()
+    for t in existing_rows or []:
+        if exclude_source_file and str(t.get("source_file") or "") == exclude_source_file:
+            continue
+        existing_keys.add(_mf_duplicate_key(t))
+
+    new_rows: list[dict] = []
+    duplicate_rows: list[dict] = []
+    seen: set[tuple[str, str, str, float, float]] = set()
+    for row in rows or []:
+        key = _mf_duplicate_key(row)
+        if key in seen or key in existing_keys:
+            duplicate_rows.append(row)
+            continue
+        seen.add(key)
+        new_rows.append(row)
+    return new_rows, duplicate_rows
+
+
 def _scheme_cashflows(txs: list[dict], terminal_value: float, end_date: str) -> list[tuple[str, float]]:
     flows: list[tuple[str, float]] = []
     for t in txs:
@@ -181,7 +220,8 @@ def _load_transactions_from_folder(folder: str) -> list[dict]:
             continue
         try:
             rows, _ = parse_mf_statement(str(f))
-            txs.extend(rows)
+            new_rows, _duplicates = partition_new_mf_transactions(rows, txs)
+            txs.extend(new_rows)
         except Exception:  # noqa: BLE001, S112
             continue
     return txs

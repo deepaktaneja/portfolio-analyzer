@@ -287,3 +287,42 @@ The 45%-below-peak auto-liquidation was removed from _intraday_gtt. It previousl
 - _peak_price_52w is defined in stage4_signals.py; verify call sites before removing, as the trailing-stop logic may compute the peak inline elsewhere.
 - No enforced drawdown limit / kill-switch; max drawdown is measured and reported, not acted upon.
 
+---
+
+## 9. Exit → Quarantine → Golden-Cross Re-Entry → Two-Strikes Lifecycle (Stage 4C)
+
+**Source:** `performance/stage4_backtest.py` (`_apply_stop_loss_strike`, `_lifecycle_stats`, `_monthly_step`, `run_backtest`) · **UI:** `app/pages/performance.py` (Backtester + Monthly SOP checklist).
+
+### Strike 1 (Quarantine)
+
+Any `GTT_STOP_LOSS` or `HARD_STOP_LOSS` exit moves the ticker to `QUARANTINE` (`strike_count = 1`), sets `sip_multiplier = 0.0`, and enforces a 90-day cooling-off period.
+
+### Golden-Cross Re-Entry
+
+After the 90-day cooldown, a quarantined ticker becomes SIP-eligible again on a monthly review date only when `Close > 200-DMA` AND `50-DMA > 200-DMA`. Importantly, `strike_count` stays armed at `1` across re-entry.
+
+### Strike 2 (Permanent Drop)
+
+If a re-entered ticker triggers a stop-loss a second time, it is permanently marked `DROPPED_TWO_STRIKES` (`permanent_exited = True`, `sip_multiplier = 0.0`) and listed in the Backtester's `dropped_tickers` diagnostics.
+
+## 10. 15-Minute Monthly Review SOP (6-Step Routine)
+
+The interactive checklist is built into the Stage 4C tab of the Performance page as the expander **"📋 15-Minute Monthly Review Checklist (SOP)"** (collapsed by default; UI only, no strategy changes).
+
+1. **Sync Holdings & Prices** (2 min) — Import trades, refresh prices; click Fetch Missing Prices if N/A.
+2. **Check Market Regime / Nifty 500 crash-freeze ≥15% DD** (1 min) — Crash-freeze check before acting.
+3. **Process Exits & Trims First** (4 min) — Review GTT / LAGGARD / CONCENTRATION trims; sells recycle capital.
+4. **Audit Quarantine & Re-Entry Watchlist** (2 min) — QUARANTINE / DROPPED (2 STRIKES): ₹0 SIP; note RE-ENTRY READY.
+5. **Deploy Monthly SIPs within ceiling** (4 min) — Buy per Stage 4C recommended SIP within monthly ceiling.
+6. **Set / Trail Broker GTTs** (2 min) — Place / trail GTT stop-loss for new buys and updated peaks.
+
+Progress indicator shows `x/6 steps completed`; a Reset button clears the checklist state.
+
+## 11. 7Y Backtest Validation Note (A/B Result)
+
+Verified 7Y backtest impact of enabling Quarantine + Golden-Cross Re-Entry (2-Strikes):
+
+- **Final Net Value:** ₹84,19,931 (+₹1,420 vs baseline)
+- **Strategy XIRR:** 18.16% (+0.01%)
+- **Max DD:** 26.8%.
+

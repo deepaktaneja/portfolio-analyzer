@@ -86,6 +86,40 @@ def test_partition_new_transactions_skips_duplicates(tmp_path):
     assert len(duplicates) == 1
 
 
+def test_partition_new_mf_transactions_skips_duplicates(tmp_path):
+    from mf.service import partition_new_mf_transactions
+
+    existing = {
+        "scheme_code": "B292G",
+        "scheme_name": "Focused",
+        "trade_date": "2006-09-27",
+        "side": "SIP",
+        "units": 138.334,
+        "nav": 14.4578,
+        "amount": 2000.0,
+        "source_file": "old.csv",
+    }
+    new_rows, duplicates = partition_new_mf_transactions(
+        [dict(existing, source_file="new.csv")], existing_rows=[existing]
+    )
+    assert new_rows == []
+    assert len(duplicates) == 1
+
+    within = {
+        "scheme_code": "B292G",
+        "scheme_name": "Focused",
+        "trade_date": "2007-01-01",
+        "side": "PURCHASE",
+        "units": 100.0,
+        "nav": 50.0,
+        "amount": 5000.0,
+        "source_file": "new.csv",
+    }
+    new_rows, duplicates = partition_new_mf_transactions([within, dict(within)])
+    assert len(new_rows) == 1
+    assert len(duplicates) == 1
+
+
 def test_holdings_snapshot_per_person(tmp_path):
     s = _store(tmp_path)
     a = s.create_person("A")

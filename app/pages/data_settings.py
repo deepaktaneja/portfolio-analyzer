@@ -440,14 +440,21 @@ def _render_mf_data(ctx: AppContext) -> None:
             key="mf_upload",
         )
         if uploads and st.button("Save uploaded MF statements", key="mf_save_uploads"):
+            import pandas as pd
+
             from mf.importers import parse_mf_statement
+            from mf.service import _load_transactions_from_folder, partition_new_mf_transactions
 
             _n_saved = 0
             _tx_total = 0
+            _new_tx_total = 0
+            _skipped_tx_total = 0
+            _mf_duplicates: list[dict] = []
             _codes: set[str] = set()
             _dates: list[str] = []
             _warns: list[str] = []
             for uf in uploads:
+                _existing_txs = _load_transactions_from_folder(str(target_dir))
                 dest = target_dir / uf.name
                 dest.write_bytes(uf.getbuffer())
                 _n_saved += 1
@@ -455,23 +462,52 @@ def _render_mf_data(ctx: AppContext) -> None:
                     _rows, _w = parse_mf_statement(str(dest))
                 except Exception as e:  # noqa: BLE001
                     _rows, _w = [], [str(e)]
+                _new_rows, _duplicate_rows = partition_new_mf_transactions(_rows, _existing_txs)
                 _tx_total += len(_rows)
-                _codes.update(str(r.get("scheme_code")) for r in _rows if r.get("scheme_code"))
-                _dates.extend(r["trade_date"] for r in _rows if r.get("trade_date"))
+                _new_tx_total += len(_new_rows)
+                _skipped_tx_total += len(_duplicate_rows)
+                _mf_duplicates.extend(_duplicate_rows)
+                _codes.update(str(r.get("scheme_code")) for r in _new_rows if r.get("scheme_code"))
+                _dates.extend(str(r.get("trade_date") or "")[:10] for r in _new_rows if r.get("trade_date"))
                 _warns.extend(_w[:5])
             _clear_data_caches()
             if _tx_total:
                 _span = f"{min(_dates)} to {max(_dates)}" if _dates else "n/a"
-                st.success(
-                    f"Saved {_n_saved} file(s) to {target_dir}. Parsed {_tx_total} transactions "
-                    f"across {len(_codes)} scheme(s) ({_span})."
+                _mf_msg = (
+                    f"✅ Uploaded {_new_tx_total} new MF transactions | "
+                    f"⚠️ Skipped {_skipped_tx_total} duplicate MF transactions."
                 )
+                if _skipped_tx_total:
+                    st.warning(_mf_msg)
+                else:
+                    st.success(_mf_msg)
                 if _upload_person != "All people":
                     st.info(f"Tip: set the sidebar **Person** filter to '{_upload_person}' to view this portfolio.")
             else:
                 st.warning(
                     f"Saved {_n_saved} file(s) to {target_dir}, but parsed 0 transactions — "
                     "confirm this is a transaction statement (date/type/units columns)."
+                )
+            if _mf_duplicates:
+                st.warning("Duplicate MF transactions skipped:")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Date": str(r.get("trade_date") or r.get("date") or "")[:10],
+                                "Scheme Name": str(r.get("scheme_name") or r.get("scheme_code") or ""),
+                                "ISIN": str(r.get("scheme_code") or r.get("isin") or r.get("scheme_name") or ""),
+                                "Folio": str(r.get("folio") or ""),
+                                "Type": str(r.get("side") or ""),
+                                "Units": float(r.get("units") or 0),
+                                "NAV": float(r.get("nav") or 0),
+                                "Amount": float(r.get("amount") or 0),
+                            }
+                            for r in _mf_duplicates
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
                 )
             for _w in _warns[:5]:
                 st.caption("• " + str(_w))
