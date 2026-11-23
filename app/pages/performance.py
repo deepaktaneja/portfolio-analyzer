@@ -1980,21 +1980,24 @@ def _render_stage4_planner(ctx: AppContext) -> None:
     with _pf_col2:
         if st.button("🔄 Sync Latest Prices", key="s4c_sync_latest_prices", use_container_width=True):
             from market_data.prices import fetch_stock_prices, resolve_provider_symbol
-            _targets = list(active_isins) + ["^CRSLDX"]
+            _targets = list(active_isins)
             _updated = 0
             _errs: list[str] = []
-            _start = _prices_as_of or str(_d.today() - _td(days=30))
+            _end = (_d.today() + _td(days=1)).isoformat()  # yfinance end is exclusive
             with st.spinner("Syncing latest prices..."):
                 for sid in _targets:
+                    # Use each ticker's own latest price date as the fetch start
+                    _ld = _latest_px_date(sid)
+                    _start = (_d.fromisoformat(_ld[:10]) + _td(days=1)).isoformat() if _ld else str(_d.today() - _td(days=30))
                     try:
                         sym = resolve_provider_symbol(sid, db_path=ctx.market_db_path)
                         if not sym:
-                            _errs.append(sid)
+                            _errs.append(f"{sid}: no symbol mapping")
                             continue
                         res = fetch_stock_prices(
                             sid,
                             start=_start,
-                            end=_d.today().isoformat(),
+                            end=_end,
                             db_path=ctx.market_db_path,
                             symbol=sym,
                             persist=True,
@@ -2017,8 +2020,12 @@ def _render_stage4_planner(ctx: AppContext) -> None:
                 _cached_data_signature.clear()  # noqa: F821
             except Exception:  # noqa: BLE001, S110
                 pass
+            # Recompute freshness after sync
+            _px_dates2 = [_latest_px_date(sid) for sid in active_isins]
+            _px_dates2 = [d for d in _px_dates2 if d]
+            _latest_after = max(_px_dates2) if _px_dates2 else ""
             if _updated:
-                st.success(f"Synced latest prices for {_updated} ticker(s).")
+                st.success(f"Synced latest prices for {_updated} ticker(s) (latest: {_d.fromisoformat(_latest_after[:10]).strftime('%d-%b-%Y') if _latest_after else 'n/a'}).")
             else:
                 st.info("No new price rows fetched (already up to date).")
             if _errs:
